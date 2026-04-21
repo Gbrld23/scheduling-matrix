@@ -177,6 +177,78 @@ window.DEFAULT_BUDGET_CONFIG = {
 };
 
 window.DAYS = ['MON','TUE','WED','THU','FRI','SAT','SUN'];
+
+// Excel-style serial for a JS Date (1900 epoch, Lotus bug accounted for)
+window.dateToSerial = function(d){
+  const epoch = new Date(Date.UTC(1899,11,30));
+  return Math.floor((Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) - epoch.getTime()) / 86400000);
+};
+window.MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+window.MONTH_ABBR  = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+// Build WEEKS / WEEK_DATES / MARCH_DAYS-equivalent for any month (Monday start, partial weeks shown)
+window.buildMonth = function(year, month){ // month = 1..12
+  const first = new Date(year, month-1, 1);
+  const daysInMonth = new Date(year, month, 0).getDate();
+  // Walk back to Monday
+  const mondayOffset = (first.getDay()+6)%7; // 0=Mon,6=Sun
+  const weekStart = new Date(year, month-1, 1 - mondayOffset);
+  const weeks = [];
+  const monthDays = [];
+  let cursor = new Date(weekStart);
+  let wkIdx = 0;
+  while (true) {
+    const dates = [];
+    const dayIdx = [];
+    let hasMonthDay = false;
+    for (let i=0;i<7;i++){
+      const d = new Date(cursor);
+      d.setDate(cursor.getDate()+i);
+      const m = d.getMonth()+1, day = d.getDate();
+      const inMonth = (d.getFullYear()===year && m===month);
+      if (inMonth) hasMonthDay = true;
+      dates.push([`${m}/${day}`, `${window.MONTH_ABBR[m-1]} ${day}`]);
+      dayIdx.push(inMonth ? day : null);
+    }
+    if (!hasMonthDay && wkIdx>0) break;
+    const startDate = dates[0], endDate = dates[6];
+    weeks.push({
+      id:'wk'+(wkIdx+1),
+      label:`${startDate[1]} – ${endDate[1]}`,
+      start:startDate[0],
+      dates, dayIdx,
+    });
+    // Build days-in-month list (for Declining Balance) — one row per in-month day
+    for (let i=0;i<7;i++){
+      if (dayIdx[i]) {
+        const d = new Date(cursor); d.setDate(cursor.getDate()+i);
+        monthDays.push({
+          date: dates[i][0],
+          dow: ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()],
+          event: 'Dark',
+          kp:{h:0,f:0}, rc:{h:0,f:0},
+        });
+      }
+    }
+    cursor.setDate(cursor.getDate()+7);
+    wkIdx++;
+    if (wkIdx>6) break;
+  }
+  // Sort monthDays by date
+  monthDays.sort((a,b)=>{
+    const [am,ad]=a.date.split('/').map(Number), [bm,bd]=b.date.split('/').map(Number);
+    return am===bm? ad-bd : am-bm;
+  });
+  // Starting serial = Monday of week 1
+  const weekStartSerial = window.dateToSerial(weekStart);
+  return {
+    year, month,
+    label: `${window.MONTH_NAMES[month-1]} ${year}`,
+    weeks, monthDays,
+    weekStartSerial,
+  };
+};
+
 window.WEEKS = [
   { id:'wk1', label:'Mar 2 – Mar 8',   start:'3/2',  dates:[['3/2','Mar 2'],['3/3','Mar 3'],['3/4','Mar 4'],['3/5','Mar 5'],['3/6','Mar 6'],['3/7','Mar 7'],['3/8','Mar 8']], dayIdx:[1,2,3,4,5,6,7] },
   { id:'wk2', label:'Mar 9 – Mar 15',  start:'3/9',  dates:[['3/9','Mar 9'],['3/10','Mar 10'],['3/11','Mar 11'],['3/12','Mar 12'],['3/13','Mar 13'],['3/14','Mar 14'],['3/15','Mar 15']], dayIdx:[8,9,10,11,12,13,14] },
@@ -802,7 +874,7 @@ function LaborPanel({ employees, laborData, actuals }) {
   },[employees]);
   return (
     <div className="labor-panel">
-      <div className="lp-header"><div className="lp-title">Labor Budget — March 2026</div><div className="lp-subtitle">Forecast vs. Actual by Department</div></div>
+      <div className="lp-header"><div className="lp-title">Labor Budget — {window.ACTIVE_MONTH_LABEL||'March 2026'}</div><div className="lp-subtitle">Forecast vs. Actual by Department</div></div>
       <div className="lp-body">
         {laborData.map(ld=>{
           const dept=getDept(ld.dept); const aHrs=actualHrsByDept[ld.dept]||0;
@@ -1073,7 +1145,7 @@ function DailyLaborView({ employees, laborData, actuals }) {
 
         {/* Declining Balance Cards */}
         <div className="dl-balance-section">
-          <div className="dl-balance-title">Declining Balance — March 2026</div>
+          <div className="dl-balance-title">Declining Balance — {window.ACTIVE_MONTH_LABEL||'March 2026'}</div>
           <div className="dl-balance-grid">
             {laborData.map(ld=>{
               const dept=getDept(ld.dept);
@@ -1132,8 +1204,12 @@ function ImportView({ onApply, actuals, activeWeek }) {
     let headerIdx = lines.findIndex(l=>l.includes('Per No') || l.includes('Work Cost Center'));
     const dataLines = headerIdx>=0 ? lines.slice(headerIdx+1) : lines;
     const records=[]; let skipped=0, outOfMonth=0;
-    const MARCH_START_SERIAL = 46082; // 3/1/26
-    const MARCH_END_SERIAL   = 46112; // 3/31/26
+    // Compute active-month serial range from buildMonth output
+    const AM = window.ACTIVE_MONTH || {year:2026, month:3};
+    const monthStart = new Date(AM.year, AM.month-1, 1);
+    const monthEnd   = new Date(AM.year, AM.month, 0);
+    const MONTH_START_SERIAL = window.dateToSerial(monthStart);
+    const MONTH_END_SERIAL   = window.dateToSerial(monthEnd);
     dataLines.forEach(line=>{
       const cols = line.split('\t');
       if(cols.length < 20) { skipped++; return; }
@@ -1144,9 +1220,8 @@ function ImportView({ onApply, actuals, activeWeek }) {
       const dept=mapCostCenter(cc,wd);
       if(!dept) { skipped++; return; }
       const serialInt = Math.round(dateSerial);
-      if (serialInt < MARCH_START_SERIAL || serialInt > MARCH_END_SERIAL) { outOfMonth++; return; }
-      const monthDay = serialInt - MARCH_START_SERIAL + 1; // 1..31
-      // Which week does this monthDay fall in? Find week containing it in dayIdx
+      if (serialInt < MONTH_START_SERIAL || serialInt > MONTH_END_SERIAL) { outOfMonth++; return; }
+      const monthDay = serialInt - MONTH_START_SERIAL + 1;
       let wkId=null, dayIdx=null;
       for (const wk of (window.WEEKS||[])) {
         const i = wk.dayIdx.indexOf(monthDay);
@@ -1155,10 +1230,10 @@ function ImportView({ onApply, actuals, activeWeek }) {
       records.push({
         name, dept, hours:hrs, amount:amt, cc,
         monthDay, wkId, dayIdx,
-        date: `3/${monthDay}`,
+        date: `${AM.month}/${monthDay}`,
       });
     });
-    if(!records.length) { setMsg({type:'err',text:`No matching records found. Ensure you're pasting from the One & Done report (tab-separated). Skipped ${skipped} rows${outOfMonth?`, ${outOfMonth} outside March 2026`:''}.`}); return; }
+    if(!records.length) { setMsg({type:'err',text:`No matching records found. Ensure you're pasting from the One & Done report (tab-separated). Skipped ${skipped} rows${outOfMonth?`, ${outOfMonth} outside ${window.ACTIVE_MONTH_LABEL||'current month'}`:''}.`}); return; }
     // Group by week → dept → dayIdx (for per-week dashboard summaries)
     const byWeek = {};
     records.forEach(r=>{
@@ -1539,7 +1614,7 @@ function DecBalView({ laborData, actuals }) {
     <div className="db-view">
       <div className="db-header">
         <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:12 }}>
-          <div className="db-title">Declining Balance — March 2026</div>
+          <div className="db-title">Declining Balance — {window.ACTIVE_MONTH_LABEL||'March 2026'}</div>
           <select className="db-dept-select" value={selDept} onChange={e => setSelDept(e.target.value)}>
             {DEPTS.map(d => <option key={d.id} value={d.id}>{d.label}</option>)}
           </select>
@@ -2131,7 +2206,7 @@ function BudgetView({ config, sales, events, onConfigChange, onSalesChange, onEv
     <div className="bg-view">
       {/* Summary */}
       <div className="bg-section">
-        <div className="bg-title">Budget Summary — March 2026</div>
+        <div className="bg-title">Budget Summary — {window.ACTIVE_MONTH_LABEL||'March 2026'}</div>
         <div className="bg-sub">Labor budget is calculated as: <strong style={{color:'#E8890C'}}>(% of sales × total area sales) + office flat</strong>. Edit sales and percentages below; totals recompute live.</div>
         <div className="bg-summary-grid">
           <div className="bg-summary-card"><div className="bg-sc-label">Total Projected Sales</div><div className="bg-sc-val" style={{color:'#E8EAF0'}}>{fmt$(salesByArea.grand)}</div><div className="bg-sc-sub">{daysInMonth} days</div></div>
@@ -2341,15 +2416,30 @@ function App() {
   // Strip .shifts from canonical employees (now lives in weekShifts)
   const cleanEmployees = initialEmployees.map(({shifts, ...rest}) => rest);
   const [employees, setEmployees] = useState(cleanEmployees);
+  // Month key helper
+  const monthKey = (am) => `${am.year}-${String(am.month).padStart(2,'0')}`;
+  // Migrate legacy top-level weekShifts/actuals/sales/events into per-month buckets
+  const savedMonth = saved?.activeMonth || {year:2026, month:3};
+  const initialMonthBuckets = (() => {
+    if (saved?.monthBuckets) return saved.monthBuckets;
+    const k = monthKey(savedMonth);
+    return {
+      [k]: {
+        weekShifts: initialWeekShifts,
+        actuals: saved?.actuals || {},
+        sales:   saved?.sales || {},
+        events:  saved?.events || {},
+      },
+    };
+  })();
+  const [monthBuckets, setMonthBuckets] = useState(initialMonthBuckets);
+  const [activeMonth, setActiveMonth] = useState(savedMonth);
+  const [viewingArchive, setViewingArchive] = useState(null);
   const [activeWeek, setActiveWeek] = useState(saved?.activeWeek || 'wk4');
-  const [weekShifts, setWeekShifts] = useState(initialWeekShifts);
   const [activeTab,  setActiveTab]  = useState('schedule');
   const [activeDept, setActiveDept] = useState('all');
   const [showLabor,  setShowLabor]  = useState(true);
-  const [actuals,    setActuals]    = useState(saved?.actuals||{});
   const [budgetCfg,  setBudgetCfg]  = useState(safeBudgetCfg);
-  const [sales,      setSales]      = useState(saved?.sales || {});
-  const [events,     setEvents]     = useState(saved?.events || {});
   const [archives,   setArchives]   = useState(saved?.archives || []);
   const [showArchMenu,setShowArchMenu]=useState(false);
   const [tweaks, setTweaks]         = useState(TWEAK_DEFAULTS);
@@ -2358,7 +2448,46 @@ function App() {
   const [syncPaused, setSyncPaused] = useState(false);
   const applyingRemoteRef = useRef(false);
 
-  useEffect(()=>{ localStorage.setItem('km_v2',JSON.stringify({employees,weekShifts,activeWeek,actuals,budgetCfg,sales,events,archives})); },[employees,weekShifts,activeWeek,actuals,budgetCfg,sales,events,archives]);
+  // ─── Active-month data derivation ──────────────────────────────────────────
+  // When viewingArchive is set, show that archived month read-only. Otherwise use activeMonth bucket.
+  const archiveEntry = viewingArchive ? archives.find(a=>a.id===viewingArchive) : null;
+  const readonly = !!archiveEntry;
+  const activeMonthKey = monthKey(activeMonth);
+  const currentBucket = archiveEntry ? {
+    weekShifts: archiveEntry.weekShifts || {},
+    actuals:    archiveEntry.actuals || {},
+    sales:      archiveEntry.sales || {},
+    events:     archiveEntry.events || {},
+  } : (monthBuckets[activeMonthKey] || { weekShifts:{wk1:{},wk2:{},wk3:{},wk4:{},wk5:{}}, actuals:{}, sales:{}, events:{} });
+
+  const weekShifts = currentBucket.weekShifts;
+  const actuals    = currentBucket.actuals;
+  const sales      = currentBucket.sales;
+  const events     = currentBucket.events;
+
+  // Ensure current month has a bucket
+  useEffect(()=>{
+    if (readonly) return;
+    if (!monthBuckets[activeMonthKey]) {
+      setMonthBuckets(b => ({ ...b, [activeMonthKey]: { weekShifts:{wk1:{},wk2:{},wk3:{},wk4:{},wk5:{}}, actuals:{}, sales:{}, events:{} }}));
+    }
+  },[activeMonthKey]);
+
+  // Setters: write to active bucket (block writes while viewing an archive)
+  const mutateBucket = (patch) => {
+    if (readonly) { alert('Viewing an archived month. Exit archive to edit.'); return; }
+    setMonthBuckets(prev => {
+      const cur = prev[activeMonthKey] || { weekShifts:{wk1:{},wk2:{},wk3:{},wk4:{},wk5:{}}, actuals:{}, sales:{}, events:{} };
+      const nextBucket = typeof patch === 'function' ? patch(cur) : { ...cur, ...patch };
+      return { ...prev, [activeMonthKey]: nextBucket };
+    });
+  };
+  const setWeekShifts = (next) => mutateBucket(cur => ({ ...cur, weekShifts: typeof next==='function' ? next(cur.weekShifts) : next }));
+  const setActuals    = (next) => mutateBucket(cur => ({ ...cur, actuals:    typeof next==='function' ? next(cur.actuals)    : next }));
+  const setSales      = (next) => mutateBucket(cur => ({ ...cur, sales:      typeof next==='function' ? next(cur.sales)      : next }));
+  const setEvents     = (next) => mutateBucket(cur => ({ ...cur, events:     typeof next==='function' ? next(cur.events)     : next }));
+
+  useEffect(()=>{ localStorage.setItem('km_v2',JSON.stringify({employees,activeMonth,monthBuckets,activeWeek,budgetCfg,archives})); },[employees,activeMonth,monthBuckets,activeWeek,budgetCfg,archives]);
 
   // ─── Firebase live sync ────────────────────────────────────────────────────
   // Subscribe: listen for remote changes and merge in
@@ -2368,15 +2497,11 @@ function App() {
       setSyncStatus(status);
       if (applyingRemote && remoteSnapshot && !syncPaused) {
         applyingRemoteRef.current = true;
-        // Merge remote → local. Only replace if remote timestamp is newer than last local change.
-        if (remoteSnapshot.employees)  setEmployees(remoteSnapshot.employees);
-        if (remoteSnapshot.weekShifts) setWeekShifts(remoteSnapshot.weekShifts);
-        if (remoteSnapshot.actuals)    setActuals(remoteSnapshot.actuals);
-        if (remoteSnapshot.budgetCfg)  setBudgetCfg(remoteSnapshot.budgetCfg);
-        if (remoteSnapshot.sales)      setSales(remoteSnapshot.sales);
-        if (remoteSnapshot.events)     setEvents(remoteSnapshot.events);
-        if (remoteSnapshot.archives)   setArchives(remoteSnapshot.archives);
-        // Clear flag after React flushes
+        if (remoteSnapshot.employees)    setEmployees(remoteSnapshot.employees);
+        if (remoteSnapshot.activeMonth)  setActiveMonth(remoteSnapshot.activeMonth);
+        if (remoteSnapshot.monthBuckets) setMonthBuckets(remoteSnapshot.monthBuckets);
+        if (remoteSnapshot.budgetCfg)    setBudgetCfg(remoteSnapshot.budgetCfg);
+        if (remoteSnapshot.archives)     setArchives(remoteSnapshot.archives);
         setTimeout(()=>{ applyingRemoteRef.current = false; }, 50);
       }
     });
@@ -2386,15 +2511,16 @@ function App() {
   // Push: when local state changes (and not from remote apply), push to Firebase
   useEffect(()=>{
     if (!window.KMSync) return;
-    if (applyingRemoteRef.current) return;  // don't echo back what just came in
+    if (applyingRemoteRef.current) return;
     if (syncPaused) return;
-    window.KMSync.push({ employees, weekShifts, activeWeek, actuals, budgetCfg, sales, events, archives });
-  }, [employees, weekShifts, actuals, budgetCfg, sales, events, archives, syncPaused]);
+    if (readonly) return;
+    window.KMSync.push({ employees, activeMonth, monthBuckets, budgetCfg, archives });
+  }, [employees, activeMonth, monthBuckets, budgetCfg, archives, syncPaused, readonly]);
 
-  // Apply user event overrides into live MARCH_DAYS so Declining Balance/Stats pick them up
+  // Apply user event overrides into live monthDays so Declining Balance/Stats pick them up
   useEffect(()=>{
     window.MARCH_DAYS.forEach((d,i)=>{ if(events[i]!==undefined) d.event = events[i]; });
-  },[events]);
+  },[events, activeMonth]);
   useEffect(()=>{
     window.addEventListener('message',e=>{
       if(e.data?.type==='__activate_edit_mode') setShowTweaks(true);
@@ -2418,21 +2544,38 @@ function App() {
     });
   },[activeWeek]);
 
-  // Week object currently viewed (dates, label, day index in month)
-  const curWeek = useMemo(()=>window.WEEKS.find(w=>w.id===activeWeek)||window.WEEKS[3],[activeWeek]);
-  // Compute active week dates + events (pure derivation, triggers rerender via context)
+  // Rebuild month calendar whenever activeMonth (or archive being viewed) changes
+  const effectiveMonth = archiveEntry ? { year: archiveEntry.year || activeMonth.year, month: archiveEntry.monthNum || activeMonth.month } : activeMonth;
+  const monthData = useMemo(()=>{
+    const md = window.buildMonth(effectiveMonth.year, effectiveMonth.month);
+    window.WEEKS = md.weeks;
+    window.MARCH_DAYS = md.monthDays;
+    window.WEEK_START_SERIAL = md.weekStartSerial;
+    window.ACTIVE_MONTH_LABEL = md.label;
+    window.ACTIVE_MONTH = { year: md.year, month: md.month };
+    return md;
+  },[effectiveMonth.year, effectiveMonth.month]);
+  // Clamp activeWeek if month changed and the old week id no longer exists
+  useEffect(()=>{
+    if (!monthData.weeks.find(w=>w.id===activeWeek)) setActiveWeek(monthData.weeks[0]?.id || 'wk1');
+  },[monthData]);
+    // Active week initial guard: wk4 only exists if the old March data. Use wk4 if available else wk1 via effect below.
+    // Week selection validity is enforced by an effect watching monthData.
+
+  // Week object currently viewed
+  const curWeek = useMemo(()=>monthData.weeks.find(w=>w.id===activeWeek)||monthData.weeks[0],[monthData,activeWeek]);
   const weekCtx = useMemo(()=>{
+    if (!curWeek) return { dates:[], events:[] };
     const dates = curWeek.dates;
     const wevents = curWeek.dayIdx.map((monthDay,i)=>{
-      const midx = monthDay!=null ? monthDay-1 : null;
-      const dayObj = midx!=null ? window.MARCH_DAYS[midx] : null;
-      const override = midx!=null ? events[midx] : undefined;
+      const midx = monthDay!=null ? (monthData.monthDays.findIndex(d=>d.date.endsWith('/'+monthDay))) : -1;
+      const dayObj = midx>=0 ? monthData.monthDays[midx] : null;
+      const override = midx>=0 ? events[midx] : undefined;
       return { day:i, event: override!==undefined ? override : (dayObj?.event||'') };
     });
-    // Also mirror to window for any non-React readers (printSchedule), but don't rely on it for render
     window.WEEK_DATES = dates; window.WEEK_EVENTS = wevents;
     return { dates, events: wevents };
-  },[curWeek,events]);
+  },[curWeek,events,monthData]);
 
   const totalHrs = activeEmployees.reduce((s,e)=>s+e.shifts.reduce((ss,[,h])=>ss+(h||0),0),0);
   const totalFcst = LABOR_DATA.reduce((s,d)=>s+d.forecast,0);
@@ -2453,11 +2596,18 @@ function App() {
         </div>
         {activeTab==='schedule'&&<>
           <div className="week-nav">
-            <button className="nav-btn" onClick={()=>{const i=window.WEEKS.findIndex(w=>w.id===activeWeek);if(i>0)setActiveWeek(window.WEEKS[i-1].id);}} disabled={activeWeek==='wk1'} style={{opacity:activeWeek==='wk1'?.35:1,cursor:activeWeek==='wk1'?'not-allowed':'pointer'}} title="Previous week">‹</button>
-            <select value={activeWeek} onChange={e=>setActiveWeek(e.target.value)} style={{background:'#1C1E26',border:'1px solid #3A3D50',borderRadius:6,color:'#E8EAF0',fontSize:12,fontWeight:600,padding:'6px 10px',outline:'none',cursor:'pointer'}}>
-              {window.WEEKS.map(w=><option key={w.id} value={w.id}>{w.label}</option>)}
-            </select>
-            <button className="nav-btn" onClick={()=>{const i=window.WEEKS.findIndex(w=>w.id===activeWeek);if(i<window.WEEKS.length-1)setActiveWeek(window.WEEKS[i+1].id);}} disabled={activeWeek==='wk5'} style={{opacity:activeWeek==='wk5'?.35:1,cursor:activeWeek==='wk5'?'not-allowed':'pointer'}} title="Next week">›</button>
+            {(() => {
+              const wks = monthData.weeks;
+              const idx = wks.findIndex(w=>w.id===activeWeek);
+              const atStart = idx<=0, atEnd = idx>=wks.length-1;
+              return <>
+                <button className="nav-btn" onClick={()=>{if(!atStart)setActiveWeek(wks[idx-1].id);}} disabled={atStart} style={{opacity:atStart?.35:1,cursor:atStart?'not-allowed':'pointer'}} title="Previous week">‹</button>
+                <select value={activeWeek} onChange={e=>setActiveWeek(e.target.value)} style={{background:'#1C1E26',border:'1px solid #3A3D50',borderRadius:6,color:'#E8EAF0',fontSize:12,fontWeight:600,padding:'6px 10px',outline:'none',cursor:'pointer'}}>
+                  {wks.map(w=><option key={w.id} value={w.id}>{w.label}</option>)}
+                </select>
+                <button className="nav-btn" onClick={()=>{if(!atEnd)setActiveWeek(wks[idx+1].id);}} disabled={atEnd} style={{opacity:atEnd?.35:1,cursor:atEnd?'not-allowed':'pointer'}} title="Next week">›</button>
+              </>;
+            })()}
           </div>
           <button className="print-btn" onClick={()=>printSchedule(activeDept,activeEmployees,curWeek.label)} title={activeDept==='all'?'Print all departments':'Print '+getDept(activeDept).label+' schedule'}>🖨 Print{activeDept!=='all'?' '+getDept(activeDept).label:''}</button>
           <button className={`labor-toggle${showLabor?' active':''}`} onClick={()=>setShowLabor(v=>!v)}>$ Labor</button>
@@ -2473,58 +2623,94 @@ function App() {
             <span style={{width:7,height:7,borderRadius:'50%',background:syncPaused?'#6B6F85':syncStatus==='online'?'#4ADE80':syncStatus==='offline'?'#FACC15':syncStatus==='error'?'#F87171':'#8B8FA8',animation:syncStatus==='online'&&!syncPaused?'pulse 2s infinite':'none'}}/>
             {syncPaused?'PAUSED':syncStatus==='online'?'LIVE':syncStatus==='connecting'?'…':syncStatus.toUpperCase()}
           </div>
-          <button className="print-btn" onClick={()=>setShowArchMenu(v=>!v)} title="Archive / Month actions">📁 March 2026 ▾</button>
+          <button className="print-btn" onClick={()=>setShowArchMenu(v=>!v)} title="Archive / Month actions" style={{background:readonly?'#EAB30833':undefined,borderColor:readonly?'#EAB308':undefined}}>
+            📁 {readonly ? `Viewing: ${archiveEntry.month} (read-only)` : monthData.label} ▾
+          </button>
           {showArchMenu && <>
             <div style={{position:'fixed',inset:0,zIndex:400}} onClick={()=>setShowArchMenu(false)}/>
             <div className="archive-menu">
-              <div className="archive-hdr">Current Month</div>
-              <div className="archive-item" onClick={()=>{
-                const blob={month:'March 2026',archived:new Date().toISOString(),employees,weekShifts,activeWeek,actuals,budgetCfg,sales,events};
-                const a=document.createElement('a');a.href='data:application/json;charset=utf-8,'+encodeURIComponent(JSON.stringify(blob,null,2));
-                a.download='scheduling-matrix-march-2026.json';a.click();setShowArchMenu(false);
-              }}>📥 Backup / Export All Data (JSON)</div>
-              <div className="archive-item" onClick={()=>{
-                const inp=document.createElement('input');inp.type='file';inp.accept='.json';
-                inp.onchange=async e=>{
-                  const f=e.target.files?.[0];if(!f)return;
-                  const txt=await f.text();let data;try{data=JSON.parse(txt);}catch{alert('Invalid JSON file.');return;}
-                  if(!confirm('Restore from this backup? Current data across ALL users will be replaced. This cannot be undone.')) return;
-                  if(data.employees)  setEmployees(data.employees.map(({shifts,...rest})=>rest));
-                  if(data.weekShifts) setWeekShifts(data.weekShifts);
-                  if(data.actuals)    setActuals(data.actuals);
-                  if(data.budgetCfg)  setBudgetCfg(data.budgetCfg);
-                  if(data.sales)      setSales(data.sales);
-                  if(data.events)     setEvents(data.events);
-                  alert('✓ Backup restored. Live-syncing to all users.');
+              {readonly ? <>
+                <div className="archive-hdr" style={{color:'#EAB308'}}>Read-only Archive</div>
+                <div style={{fontSize:10,color:'#8B8FA8',padding:'6px 10px',lineHeight:1.5}}>You're viewing <b style={{color:'#E8EAF0'}}>{archiveEntry.month}</b>. Exit to return to the current month and resume editing.</div>
+                <div className="archive-item" onClick={()=>{setViewingArchive(null);setShowArchMenu(false);}}>← Exit Archive View</div>
+                <div className="archive-divider"/>
+                <div className="archive-item" onClick={()=>{
+                  const blob={...archiveEntry};
+                  const d=document.createElement('a');d.href='data:application/json;charset=utf-8,'+encodeURIComponent(JSON.stringify(blob,null,2));
+                  d.download=`scheduling-matrix-${archiveEntry.month.toLowerCase().replace(/ /g,'-')}.json`;d.click();setShowArchMenu(false);
+                }}>📥 Export this archive (JSON)</div>
+              </> : <>
+                <div className="archive-hdr">Current Month — {monthData.label}</div>
+                <div className="archive-item" onClick={()=>{
+                  const blob={version:2,employees,activeMonth,monthBuckets,budgetCfg,archives,exported:new Date().toISOString()};
+                  const a=document.createElement('a');a.href='data:application/json;charset=utf-8,'+encodeURIComponent(JSON.stringify(blob,null,2));
+                  a.download=`scheduling-matrix-backup-${new Date().toISOString().slice(0,10)}.json`;a.click();setShowArchMenu(false);
+                }}>📥 Backup / Export All Data (JSON)</div>
+                <div className="archive-item" onClick={()=>{
+                  const inp=document.createElement('input');inp.type='file';inp.accept='.json';
+                  inp.onchange=async e=>{
+                    const f=e.target.files?.[0];if(!f)return;
+                    const txt=await f.text();let data;try{data=JSON.parse(txt);}catch{alert('Invalid JSON file.');return;}
+                    if(!confirm('Restore from this backup? Current data across ALL users will be replaced. This cannot be undone.')) return;
+                    if(data.employees)    setEmployees(data.employees.map(({shifts,...rest})=>rest));
+                    if(data.activeMonth)  setActiveMonth(data.activeMonth);
+                    if(data.monthBuckets) setMonthBuckets(data.monthBuckets);
+                    else if(data.weekShifts){ // v1 backup compatibility
+                      const k=monthKey(data.activeMonth||activeMonth);
+                      setMonthBuckets({[k]:{weekShifts:data.weekShifts,actuals:data.actuals||{},sales:data.sales||{},events:data.events||{}}});
+                    }
+                    if(data.budgetCfg)    setBudgetCfg(data.budgetCfg);
+                    if(data.archives)     setArchives(data.archives);
+                    alert('✓ Backup restored. Live-syncing to all users.');
+                    setShowArchMenu(false);
+                  };
+                  inp.click();
+                }}>📤 Restore from Backup (JSON)</div>
+                <div className="archive-divider"/>
+                <div className="archive-item" onClick={()=>{
+                  // Roll forward to next month
+                  const nextAM = activeMonth.month===12 ? {year:activeMonth.year+1, month:1} : {year:activeMonth.year, month:activeMonth.month+1};
+                  const nextMD = window.buildMonth(nextAM.year, nextAM.month);
+                  if(!confirm(`Roll over to ${nextMD.label}?\n\n• Current month (${monthData.label}) will be archived and viewable read-only\n• Employees carry forward\n• Schedule starts blank (no shifts)\n• Events reset to "Dark"\n• Sales zero out; % allocation & H&W rates carry forward\n• Imported actuals archive with ${monthData.label}`)) return;
+                  // Archive current
+                  const curBucket = monthBuckets[activeMonthKey];
+                  const snapshot = { id:Date.now(), month:monthData.label, monthKey:activeMonthKey, year:activeMonth.year, monthNum:activeMonth.month, archived:new Date().toISOString(),
+                    weekShifts:JSON.parse(JSON.stringify(curBucket?.weekShifts||{})),
+                    actuals:JSON.parse(JSON.stringify(curBucket?.actuals||{})),
+                    sales:JSON.parse(JSON.stringify(curBucket?.sales||{})),
+                    events:JSON.parse(JSON.stringify(curBucket?.events||{})),
+                    employees:JSON.parse(JSON.stringify(employees)),
+                    budgetCfg:JSON.parse(JSON.stringify(budgetCfg)),
+                  };
+                  setArchives([snapshot, ...archives].slice(0,24));
+                  // New month: blank bucket
+                  const newKey = `${nextAM.year}-${String(nextAM.month).padStart(2,'0')}`;
+                  const newWeekShifts = {};
+                  nextMD.weeks.forEach(w=>{ newWeekShifts[w.id] = {}; });
+                  setMonthBuckets(b => ({ ...b, [newKey]: { weekShifts:newWeekShifts, actuals:{}, sales:{}, events:{} }}));
+                  setActiveMonth(nextAM);
+                  setActiveWeek(nextMD.weeks[0].id);
+                  // Zero projected sales — already blank in new bucket. Carry % allocation & H&W (budgetCfg unchanged).
+                  alert(`✓ Rolled to ${nextMD.label}.\n\n${monthData.label} archived. You can view it from the Archived section below.`);
                   setShowArchMenu(false);
-                };
-                inp.click();
-              }}>📤 Restore from Backup (JSON)</div>
-              <div className="archive-divider"/>
-              <div className="archive-item" onClick={()=>{
-                if(!confirm('Archive current month and start fresh? Schedule cells and actuals will clear; employees and % allocation will carry over as template.')) return;
-                const snapshot={id:Date.now(),month:'March 2026',archived:new Date().toISOString(),employees:JSON.parse(JSON.stringify(employees)),weekShifts:JSON.parse(JSON.stringify(weekShifts)),activeWeek,actuals:JSON.parse(JSON.stringify(actuals)),budgetCfg:JSON.parse(JSON.stringify(budgetCfg)),sales:JSON.parse(JSON.stringify(sales)),events:JSON.parse(JSON.stringify(events))};
-                setArchives([snapshot,...archives].slice(0,3));
-                setWeekShifts({wk1:{},wk2:{},wk3:{},wk4:{},wk5:{}});
-                setActuals({});setSales({});setEvents({});
-                alert('✓ March 2026 archived. Schedule cleared. Employees, % allocation & office flat retained.');
-                setShowArchMenu(false);
-              }}>✨ Start New Month →</div>
-              {archives.length>0 && <>
-                <div className="archive-divider"/>
-                <div className="archive-hdr">Archived ({archives.length})</div>
-                {archives.map(a=>(
-                  <div key={a.id} className="archive-item" onClick={()=>{
-                    const blob={...a};
-                    const d=document.createElement('a');d.href='data:application/json;charset=utf-8,'+encodeURIComponent(JSON.stringify(blob,null,2));
-                    d.download=`scheduling-matrix-${a.month.toLowerCase().replace(/ /g,'-')}.json`;d.click();setShowArchMenu(false);
-                  }}>
-                    <span style={{flex:1}}>{a.month}</span>
-                    <span style={{fontSize:9,color:'#6B6F85'}}>{new Date(a.archived).toLocaleDateString()}</span>
-                  </div>
-                ))}
-                <div className="archive-divider"/>
-                <div className="archive-item danger" onClick={()=>{if(confirm('Clear all archives?')){setArchives([]);setShowArchMenu(false);}}}>🗑 Clear Archives</div>
+                }}>✨ Roll to next month →</div>
+                {archives.length>0 && <>
+                  <div className="archive-divider"/>
+                  <div className="archive-hdr">Archived ({archives.length})</div>
+                  {archives.map(a=>(
+                    <div key={a.id} className="archive-item" style={{display:'flex',alignItems:'center',gap:6}}>
+                      <span style={{flex:1,cursor:'pointer'}} onClick={()=>{setViewingArchive(a.id);setShowArchMenu(false);}} title="View read-only">👁 {a.month}</span>
+                      <span style={{fontSize:9,color:'#6B6F85'}}>{new Date(a.archived).toLocaleDateString()}</span>
+                      <span style={{cursor:'pointer',opacity:.6,padding:'0 4px'}} title="Download JSON" onClick={e=>{e.stopPropagation();
+                        const blob={...a};
+                        const d=document.createElement('a');d.href='data:application/json;charset=utf-8,'+encodeURIComponent(JSON.stringify(blob,null,2));
+                        d.download=`scheduling-matrix-${a.month.toLowerCase().replace(/ /g,'-')}.json`;d.click();setShowArchMenu(false);
+                      }}>⬇</span>
+                    </div>
+                  ))}
+                  <div className="archive-divider"/>
+                  <div className="archive-item danger" onClick={()=>{if(confirm('Clear all archives? This cannot be undone.')){setArchives([]);setShowArchMenu(false);}}}>🗑 Clear Archives</div>
+                </>}
               </>}
             </div>
           </>}
