@@ -1,0 +1,2801 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Scheduling Matrix</title>
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<!-- Firebase SDK (compat mode — works via script tags, no bundler) -->
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
+<script>
+// ─── Firebase Sync Module ──────────────────────────────────────────────────────
+(function(){
+  const firebaseConfig = {
+    apiKey: "AIzaSyCht6CtwSPjedXPsk19XR26rasEK7ao7Sc",
+    authDomain: "la-ctr-scheduling.firebaseapp.com",
+    projectId: "la-ctr-scheduling",
+    databaseURL: "https://la-ctr-scheduling-default-rtdb.firebaseio.com",
+    storageBucket: "la-ctr-scheduling.firebasestorage.app",
+    messagingSenderId: "491153441113",
+    appId: "1:491153441113:web:8da848473c55c3de76cc48",
+  };
+  try {
+    firebase.initializeApp(firebaseConfig);
+  } catch (e) { console.warn('Firebase init issue:', e); }
+
+  const CLIENT_ID = (() => {
+    let id = localStorage.getItem('km_client_id');
+    if (!id) { id = 'c_' + Math.random().toString(36).slice(2,10) + '_' + Date.now().toString(36); localStorage.setItem('km_client_id', id); }
+    return id;
+  })();
+
+  const DOC_PATH = 'scheduling/v1';  // all shared state lives under this node
+  const listeners = new Set();
+  let status = 'connecting';  // 'connecting' | 'online' | 'offline' | 'error'
+  let remoteSnapshot = null;
+  let applyingRemote = false;
+  let writeTimer = null;
+  let lastPushedHash = null;
+
+  const notify = () => listeners.forEach(fn => { try { fn({ status, remoteSnapshot, applyingRemote }); } catch(e){} });
+
+  const setStatus = s => { if (s !== status) { status = s; notify(); } };
+
+  const hash = obj => {
+    try { const s = JSON.stringify(obj); let h=5381; for (let i=0;i<s.length;i++) h=((h<<5)+h)+s.charCodeAt(i); return h; } catch(e) { return Math.random(); }
+  };
+
+  // Auth: anonymous sign-in → then subscribe to the shared doc
+  firebase.auth().onAuthStateChanged(user => {
+    if (user) {
+      const ref = firebase.database().ref(DOC_PATH);
+      ref.on('value', snap => {
+        const val = snap.val();
+        if (!val) { setStatus('online'); return; }
+        // Ignore our own writes (sender matches)
+        if (val._meta && val._meta.sender === CLIENT_ID && val._meta.hash === lastPushedHash) {
+          setStatus('online');
+          return;
+        }
+        remoteSnapshot = val;
+        applyingRemote = true;
+        notify();
+        applyingRemote = false;
+        setStatus('online');
+      }, err => {
+        console.error('Firebase read error:', err);
+        setStatus('error');
+      });
+      // Connection status
+      firebase.database().ref('.info/connected').on('value', s => {
+        setStatus(s.val() ? 'online' : 'offline');
+      });
+    }
+  });
+
+  firebase.auth().signInAnonymously().catch(e => {
+    console.error('Firebase anon auth failed:', e);
+    setStatus('error');
+  });
+
+  window.KMSync = {
+    CLIENT_ID,
+    subscribe(fn) { listeners.add(fn); fn({ status, remoteSnapshot, applyingRemote }); return () => listeners.delete(fn); },
+    push(state) {
+      // Debounce — coalesce rapid edits into one write
+      clearTimeout(writeTimer);
+      writeTimer = setTimeout(() => {
+        const h = hash(state);
+        lastPushedHash = h;
+        const payload = { ...state, _meta: { sender: CLIENT_ID, ts: Date.now(), hash: h } };
+        firebase.database().ref(DOC_PATH).set(payload).catch(e => {
+          console.error('Firebase write error:', e);
+          setStatus('error');
+        });
+      }, 600);
+    },
+    get status() { return status; },
+    async pushImmediate(state) {
+      clearTimeout(writeTimer);
+      const h = hash(state); lastPushedHash = h;
+      const payload = { ...state, _meta: { sender: CLIENT_ID, ts: Date.now(), hash: h } };
+      return firebase.database().ref(DOC_PATH).set(payload);
+    },
+  };
+})();
+</script>
+<script>
+// ─── DEPARTMENTS ──────────────────────────────────────────────────────────────
+window.DEPTS = [
+  { id:'kitchen_prem', label:'Kitchen Prem', color:'#E8890C', light:'#E8890C18', cc:'33417', ccTag:'BOH' },
+  { id:'rc_kitchen',   label:'R&C Kitchen',  color:'#16A34A', light:'#16A34A18', cc:'33417' },
+  { id:'rc_foh',       label:'R&C FOH',      color:'#06B6D4', light:'#06B6D418', cc:'33418' },
+  { id:'stewarding',   label:'Stewarding',   color:'#2563EB', light:'#2563EB18', cc:'33422', ccTag:'BOH' },
+  { id:'warehouse',    label:'Warehouse',    color:'#7C3AED', light:'#7C3AED18', cc:'55936' },
+  { id:'bars',         label:'Bars',         color:'#DC2626', light:'#DC262618', cc:'33421' },
+  { id:'admin',        label:'Admin',        color:'#0D9488', light:'#0D948818', cc:'33422' },
+  { id:'group_sales',  label:'Group Sales',  color:'#6366F1', light:'#6366F118', cc:'33416' },
+];
+
+// Cost center → department mapping (from One & Done col L)
+window.COST_CENTER_MAP = {
+  '33416': 'group_sales',
+  '33417': 'kitchen_prem', // use workDesc to distinguish vs rc_kitchen
+  '33418': 'rc_foh',
+  '33421': 'bars',
+  '33422': 'stewarding',   // use workDesc to distinguish vs admin
+  '55936': 'warehouse',
+};
+window.mapCostCenter = function(cc, workDesc) {
+  const d = (workDesc||'').toUpperCase();
+  const c = String(cc||'').trim();
+  if (c === '33417') {
+    if (d.includes('R&C') || d.includes('CONCESSION') || d.includes('SPECIALTY') || d.includes('GENERAL')) return 'rc_kitchen';
+    return 'kitchen_prem';
+  }
+  if (c === '33422') {
+    if (d.includes('ADMIN') || d.includes('OFFICE') || d.includes('GROUP SALES')) return 'admin';
+    return 'stewarding';
+  }
+  return window.COST_CENTER_MAP[c] || null;
+};
+
+// ─── GROUPINGS (FOH/BOH & Premium/R&C) ────────────────────────────────────────
+window.DEPT_GROUPS = {
+  foh: ['group_sales','bars','rc_foh'],
+  boh: ['kitchen_prem','admin','warehouse','stewarding','rc_kitchen'],
+  premium: ['group_sales','kitchen_prem','bars','admin','warehouse','stewarding'],
+  rc: ['rc_foh','rc_kitchen'],
+};
+
+// ─── DEFAULT BUDGET CONFIG (from LABOR FORECAST screenshot) ───────────────────
+// pct = % of projected sales. area = which sales pool this % applies to (premium or rc).
+window.DEFAULT_BUDGET_CONFIG = {
+  officeFlat: 20000,  // monthly $ (EVEN AMT, split across days)
+  pcts: {
+    // BOH
+    warehouse:    { pct: 1.0, area: 'premium' },
+    rc_kitchen:   { pct: 7.0, area: 'rc'      }, // 7% culinary + 2% stewarding = 9% combined
+    kitchen_prem: { pct: 8.0, area: 'premium' }, // 8% culinary + 2% stewarding = 10% combined
+    stewarding:   { pct: 2.0, area: 'premium' },
+    // FOH
+    rc_foh:       { pct: 16.0, area: 'rc'      },
+    bars:         { pct: 10.0, area: 'premium' },
+    group_sales:  { pct: 9.0,  area: 'premium' }, // "PREMIUM 9%" from screenshot
+    // Admin: office flat amount, no %
+    admin:        { pct: 0.0, area: 'premium' },
+  },
+  // H&W / fringe rates — $ per hour worked, broken into H&W + Education + Legal
+  hwPlans: {
+    b: { name:'B Plan', hw:8.91, edu:0.07, legal:0.11 },
+    v: { name:'V Plan', hw:3.42, edu:0.07, legal:0.11 },
+  },
+  defaultPlan: 'b',
+};
+
+window.DAYS = ['MON','TUE','WED','THU','FRI','SAT','SUN'];
+
+// Excel-style serial for a JS Date (1900 epoch, Lotus bug accounted for)
+window.dateToSerial = function(d){
+  const epoch = new Date(Date.UTC(1899,11,30));
+  return Math.floor((Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) - epoch.getTime()) / 86400000);
+};
+window.MONTH_NAMES = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+window.MONTH_ABBR  = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+// Build WEEKS / WEEK_DATES / MARCH_DAYS-equivalent for any month (Monday start, partial weeks shown)
+window.buildMonth = function(year, month){ // month = 1..12
+  const first = new Date(year, month-1, 1);
+  const daysInMonth = new Date(year, month, 0).getDate();
+  // Walk back to Monday
+  const mondayOffset = (first.getDay()+6)%7; // 0=Mon,6=Sun
+  const weekStart = new Date(year, month-1, 1 - mondayOffset);
+  const weeks = [];
+  const monthDays = [];
+  let cursor = new Date(weekStart);
+  let wkIdx = 0;
+  while (true) {
+    const dates = [];
+    const dayIdx = [];
+    let hasMonthDay = false;
+    for (let i=0;i<7;i++){
+      const d = new Date(cursor);
+      d.setDate(cursor.getDate()+i);
+      const m = d.getMonth()+1, day = d.getDate();
+      const inMonth = (d.getFullYear()===year && m===month);
+      if (inMonth) hasMonthDay = true;
+      dates.push([`${m}/${day}`, `${window.MONTH_ABBR[m-1]} ${day}`]);
+      dayIdx.push(inMonth ? day : null);
+    }
+    if (!hasMonthDay && wkIdx>0) break;
+    const startDate = dates[0], endDate = dates[6];
+    weeks.push({
+      id:'wk'+(wkIdx+1),
+      label:`${startDate[1]} – ${endDate[1]}`,
+      start:startDate[0],
+      dates, dayIdx,
+    });
+    // Build days-in-month list (for Declining Balance) — one row per in-month day
+    for (let i=0;i<7;i++){
+      if (dayIdx[i]) {
+        const d = new Date(cursor); d.setDate(cursor.getDate()+i);
+        monthDays.push({
+          date: dates[i][0],
+          dow: ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()],
+          event: 'Dark',
+          kp:{h:0,f:0}, rc:{h:0,f:0},
+        });
+      }
+    }
+    cursor.setDate(cursor.getDate()+7);
+    wkIdx++;
+    if (wkIdx>6) break;
+  }
+  // Sort monthDays by date
+  monthDays.sort((a,b)=>{
+    const [am,ad]=a.date.split('/').map(Number), [bm,bd]=b.date.split('/').map(Number);
+    return am===bm? ad-bd : am-bm;
+  });
+  // Starting serial = Monday of week 1
+  const weekStartSerial = window.dateToSerial(weekStart);
+  return {
+    year, month,
+    label: `${window.MONTH_NAMES[month-1]} ${year}`,
+    weeks, monthDays,
+    weekStartSerial,
+  };
+};
+
+window.WEEKS = [
+  { id:'wk1', label:'Mar 2 – Mar 8',   start:'3/2',  dates:[['3/2','Mar 2'],['3/3','Mar 3'],['3/4','Mar 4'],['3/5','Mar 5'],['3/6','Mar 6'],['3/7','Mar 7'],['3/8','Mar 8']], dayIdx:[1,2,3,4,5,6,7] },
+  { id:'wk2', label:'Mar 9 – Mar 15',  start:'3/9',  dates:[['3/9','Mar 9'],['3/10','Mar 10'],['3/11','Mar 11'],['3/12','Mar 12'],['3/13','Mar 13'],['3/14','Mar 14'],['3/15','Mar 15']], dayIdx:[8,9,10,11,12,13,14] },
+  { id:'wk3', label:'Mar 16 – Mar 22', start:'3/16', dates:[['3/16','Mar 16'],['3/17','Mar 17'],['3/18','Mar 18'],['3/19','Mar 19'],['3/20','Mar 20'],['3/21','Mar 21'],['3/22','Mar 22']], dayIdx:[15,16,17,18,19,20,21] },
+  { id:'wk4', label:'Mar 23 – Mar 29', start:'3/23', dates:[['3/23','Mar 23'],['3/24','Mar 24'],['3/25','Mar 25'],['3/26','Mar 26'],['3/27','Mar 27'],['3/28','Mar 28'],['3/29','Mar 29']], dayIdx:[22,23,24,25,26,27,28] },
+  { id:'wk5', label:'Mar 30 – Apr 5',  start:'3/30', dates:[['3/30','Mar 30'],['3/31','Mar 31'],['4/1','Apr 1'],['4/2','Apr 2'],['4/3','Apr 3'],['4/4','Apr 4'],['4/5','Apr 5']], dayIdx:[29,30,null,null,null,null,null] },
+];
+window.WEEK_DATES = window.WEEKS[3].dates; // default week 4 (current)
+window.WEEK_EVENTS = [
+  {day:0,event:'Dark'},{day:1,event:'Dark'},{day:2,event:'Dark'},
+  {day:3,event:'American Pharmacist'},{day:4,event:'American Pharmacist'},
+  {day:5,event:'Gymnastics / Am. Pharm.'},{day:6,event:'Gymnastics / Am. Pharm.'},
+];
+window.WEEK_START_SERIAL = 46104; // Mon 3/23/26
+
+window.AVG_RATES = {
+  kitchen_prem:31, rc_kitchen:31, rc_foh:28,
+  stewarding:27, warehouse:26, bars:29, admin:35, group_sales:28
+};
+
+window.STATUS_COLORS = {
+  C:  {bg:'#E8890C22',color:'#E8890C'}, P:  {bg:'#16A34A22',color:'#16A34A'},
+  B:  {bg:'#6366F122',color:'#818CF8'}, R:  {bg:'#7C3AED22',color:'#A78BFA'},
+  S:  {bg:'#2563EB22',color:'#60A5FA'}, LD: {bg:'#DC262622',color:'#F87171'},
+  CA: {bg:'#06B6D422',color:'#22D3EE'}, BA: {bg:'#D946EF22',color:'#E879F9'},
+  STW:{bg:'#2563EB22',color:'#60A5FA'}, H:  {bg:'#E8890C33',color:'#FCD34D'},
+  OFF:{bg:'transparent',color:'#3A3D50'},'':{bg:'transparent',color:'#3A3D50'},
+};
+
+// [status, hours, time] per day index 0=Mon…6=Sun
+window.INIT_EMPLOYEES = [
+  // ── KITCHEN PREM ──────────────────────────────────────────────────────────
+  {id:1, name:'Aguilar, Luis',        dept:'kitchen_prem',role:'Cook',           shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['C',8,'5A–1P'],  ['C',8,'4A–12P'],['C',8,'4A–12P'],['C',8,'4A–12P']]},
+  {id:2, name:'Guzman, Baltazar',     dept:'kitchen_prem',role:'Cook',           shifts:[['OFF',0,''],[''  ,0,''],['C',8,'6A–2P'],['C',8,'5A–1P'],['C',8,'4A–12P'],['C',8,'4A–12P'],['OFF',0,'']]},
+  {id:3, name:'Argueta, Yanira',      dept:'kitchen_prem',role:'Cook',           shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['C',8,'5A–1P'],  ['C',8,'4A–12P'],['C',8,'4A–12P'],['C',8,'4A–12P']]},
+  {id:4, name:'Henriquez, Edith',     dept:'kitchen_prem',role:'Cook',           shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['C',8,'6A–2P R&C'],['C',8,'6A–2P R&C'],['C',8,'4A–12P'],['C',8,'4A–12P']]},
+  {id:5, name:'Gonzalez, Teresa',     dept:'kitchen_prem',role:'Cook / Pantry',  shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['C',8,'6A–2P R&C'],['C',8,'6A–2P R&C'],['C',8,'4A–12P'],['C',8,'4A–12P']]},
+  {id:6, name:'Gonzalez, Sandra',     dept:'kitchen_prem',role:'Cook',           shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['C',8,'9A–5P COM'],['C',8,'8A–4P'],  ['C',8,'6A–2P R&C'],['C',8,'4A–12P']]},
+  {id:7, name:'Oceguera P., Eduardo', dept:'kitchen_prem',role:'Stand Lead',     shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['C',8,'6A–2P SUSHI'],['C',8,'6A–2P SUSHI'],['C',8,'6A–2P SUSHI'],['C',8,'4A–12P']]},
+  {id:8, name:'Partida, Crystal',     dept:'kitchen_prem',role:'Cook',           shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['C',8,'9A–5P COM'],['C',8,'9A–5P GAL'],['C',8,'8A–4P COM'],['C',8,'4A–12P']]},
+  {id:9, name:'Aguilar, Isaiah',      dept:'kitchen_prem',role:'Cook',           shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['C',8,'10A–6P'],  ['C',8,'9A–5P R&C'],['C',8,'8A–4P COM'],['C',8,'4A–12P']]},
+  {id:10,name:'Bernabe, Katy',        dept:'kitchen_prem',role:'Cook',           shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['C',8,'10A–6P'],  ['C',8,'9A–5P COM'],['C',8,'8A–4P COM'],['C',8,'4A–12P']]},
+  {id:11,name:'Tzul, Esteban',        dept:'kitchen_prem',role:'Cook',           shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['C',8,'12P–8P'],  ['C',8,'9A–5P COM'],['C',8,'9A–5P GAL'],['C',8,'4A–12P']]},
+  {id:12,name:'Conner, Laquisha',     dept:'kitchen_prem',role:'Cook',           shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['C',8,'12P–8P'],  ['C',8,'12P–8P R&C'],['C',8,'10A–6P'],['C',8,'4A–12P']]},
+  {id:13,name:'Zuniga, Leonidas',     dept:'kitchen_prem',role:'Cook',           shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],        ['C',8,'9A–5P COM'],['C',8,'8A–4P COM'],['C',8,'4A–12P']]},
+  {id:14,name:'Montano, Jose',        dept:'kitchen_prem',role:'Lead Cook',      shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['C',8,'9A–5P COM'],['C',8,'8A–4P'],  ['LD',8,'9A–5P LEAD'],['',0,'']]},
+  {id:15,name:'Guerra, Maria',        dept:'kitchen_prem',role:'Cook',           shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],        ['P',8,'12P–8P GAL'],['C',8,'10A–6P'],['',0,'']]},
+  {id:16,name:'Villasenor, Ignacio',  dept:'kitchen_prem',role:'Pantry',         shifts:[['OFF',0,''],['P',8,'6A–2P'],['P',8,'6A–2P'],['P',8,'4A–12P'],['P',8,'4A–12P'],['P',8,'4A–12P'],['OFF',0,'']]},
+  {id:17,name:'Lopez, Margarita',     dept:'kitchen_prem',role:'Pantry',         shifts:[['OFF',0,''],[''  ,0,''],['P',8,'6A–2P'],['P',8,'4A–12P'],['P',8,'4A–12P'],['P',8,'4A–12P'],['P',8,'4A–12P']]},
+  {id:18,name:'Ramos, Esperanza',     dept:'kitchen_prem',role:'Pantry',         shifts:[['OFF',0,''],[''  ,0,''],['P',8,'6A–2P'],['P',8,'4A–12P'],['P',8,'4A–12P'],['P',8,'4A–12P'],['P',8,'4A–12P']]},
+  {id:19,name:'Simmons, Shearon',     dept:'kitchen_prem',role:'Pantry / COM',   shifts:[['OFF',0,''],[''  ,0,''],['P',8,'7A–3P COM'],['P',8,'7A–3P COM'],['P',8,'7A–3P COM'],['P',8,'4A–12P'],['P',8,'4A–12P']]},
+  {id:20,name:'Ramos, Claudia',       dept:'kitchen_prem',role:'Pantry',         shifts:[['OFF',0,''],[''  ,0,''],['P',8,'6A–2P'],['P',8,'4A–12P'],['P',8,'4A–12P'],['P',8,'4A–12P'],['AVAIL',0,'']]},
+  {id:21,name:'Hernandez, Leticia',   dept:'kitchen_prem',role:'Lead Stew/Pantry',shifts:[['OFF',0,''],[''  ,0,''],['P',8,'6A–2P'],['P',8,'4A–12P'],['P',8,'4A–12P'],['P',8,'4A–12P'],['P',8,'4A–12P']]},
+  {id:22,name:'Salinas, Adriana',     dept:'kitchen_prem',role:'Baker / Pantry', shifts:[['OFF',0,''],['B',8,'6A–2P'],['B',8,'5A–1P'],['B',8,'4A–12P'],['B',8,'4A–12P'],['B',8,'4A–12P'],['OFF',0,'']]},
+  {id:23,name:'Salinas, Irma',        dept:'kitchen_prem',role:'Baker / Pantry', shifts:[['OFF',0,''],[''  ,0,''],['B',8,'6A–2P'],['B',8,'5A–1P'],['B',8,'4A–12P'],['B',8,'4A–12P'],['B',8,'4A–12P']]},
+  {id:24,name:'Vega, Yadira',         dept:'kitchen_prem',role:'Baker / Pantry', shifts:[['OFF',0,''],[''  ,0,''],['B',8,'6A–2P'],['B',8,'4A–12P'],['B',8,'4A–12P'],['B',8,'4A–12P'],['AVAIL',0,'']]},
+  // ── R&C KITCHEN ───────────────────────────────────────────────────────────
+  {id:30,name:'Vega, Yolanda',        dept:'rc_kitchen',  role:'Cook / Pantry',  shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['C',8,'4A–12P'],['C',8,'4A–12P'],['C',8,'4A–12P'],['C',8,'4A–12P']]},
+  {id:31,name:'Pereira, Oscar',       dept:'rc_kitchen',  role:'Lead Cook',      shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['C',8,'4A–12P'],['C',8,'4A–12P'],['C',8,'4A–12P'],['C',8,'4A–12P']]},
+  {id:32,name:'Villanueva, Marco',    dept:'rc_kitchen',  role:'Lead / GAL',     shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['LD',8,'10A–6P LEAD'],['LD',8,'9A–5P LEAD'],['CANCEL',0,''],['',0,'']]},
+  {id:33,name:'Razo, Silvia',         dept:'rc_kitchen',  role:'Pantry / COM',   shifts:[['OFF',0,''],[''  ,0,''],['P',8,'7A–3P COM'],['P',8,'7A–3P COM'],['P',8,'7A–3P COM'],['P',8,'4A–12P'],['P',8,'4A–12P']]},
+  {id:34,name:'Jarquin, Sandra',      dept:'rc_kitchen',  role:'Pantry / Stew',  shifts:[['OFF',0,''],[''  ,0,''],['P',8,'7A–3P COM'],['P',8,'7A–3P COM'],['P',8,'STEWARD'],['S',8,'STEWARD'],['',0,'']]},
+  {id:35,name:'Hernandez, Maria D.',  dept:'rc_kitchen',  role:'Pantry / Steward',shifts:[['OFF',0,''],['S',8,'6A–2P'],['P',8,'6A–2P'],['P',8,'4A–12P'],['P',8,'4A–12P'],['P',8,'4A–12P'],['OFF',0,'']]},
+  {id:36,name:'Hicks, Christopher',   dept:'rc_kitchen',  role:'Cook',           shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,'']]},
+  // ── R&C FOH ───────────────────────────────────────────────────────────────
+  {id:40,name:'Acuna, Alberto',       dept:'rc_foh',      role:'Stand Lead',     shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['LD',8,'7A–3P MARKET'],['LD',8,'7A–3P MARKET'],['LD',8,'7A–3P MARKET'],['LD',8,'7A–3P']]},
+  {id:41,name:'Napoles, Mercedes',    dept:'rc_foh',      role:'Stand Lead',     shifts:[['OFF',0,''],[''  ,0,''],['',8,'GROUNDWORKS'],['',8,'9A–5P COM'],['LD',8,'9A–5P COM'],['LD',8,'9A–5P COM'],['LD',8,'9A–5P COM']]},
+  {id:42,name:'Souto, Mariela',       dept:'rc_foh',      role:'Stand Lead',     shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['LD',8,'12P–8P GAL'],['LD',8,'9A–5P GAL'],['LD',8,'CASHIER'],['CA',8,'CASHIER']]},
+  {id:43,name:'Huerta, Norma',        dept:'rc_foh',      role:'Lead / Cashier', shifts:[['AVAIL',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['',8,'LEAD'],['',8,'LEAD'],['LD',8,'LEAD']]},
+  {id:44,name:'Beltran, Alicia',      dept:'rc_foh',      role:'Lead / Cashier', shifts:[['N/A',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,'']]},
+  {id:45,name:'Gallegos, Suzanne',    dept:'rc_foh',      role:'Stand Lead',     shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['CA',8,'CASHIER'],['CA',8,'CASHIER'],['CA',8,'CASHIER']]},
+  {id:46,name:'Martinez, Patricia',   dept:'rc_foh',      role:'Stand Lead',     shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['STW',8,'STANDWORKER'],['STW',8,'STANDWORKER'],['STW',8,'STANDWORKER']]},
+  {id:47,name:'Trejo, Teresa (RC)',   dept:'rc_foh',      role:'Lead / Barista', shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',8,'GROUNDWORKS'],['',8,'GROUNDWORKS'],['',8,'GROUNDWORKS'],['',8,'GROUNDWORKS']]},
+  {id:48,name:'Barajas, Maria',       dept:'rc_foh',      role:'Lead / Cashier', shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',4,'PSST'],['',0,''],  ['',6,'PSST'],['',4,'PSST']]},
+  {id:49,name:'Rivera, Danny',        dept:'rc_foh',      role:'GW Cashier',     shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['CA',6,'6A–2P SH'],['CA',8,'6A–2P SH'],['CA',8,'6A–2P SH'],['CA',8,'6A–2P SH']]},
+  {id:50,name:'Mares, Jade',          dept:'rc_foh',      role:'Cashier',        shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',8,'GROUNDWORKS'],['CA',8,'10A–6P WH'],['CA',8,'10A–6P WH'],['CA',8,'10A–6P WH']]},
+  {id:51,name:'Urias, Rosa',          dept:'rc_foh',      role:'GW Barista',     shifts:[['OFF',0,''],[''  ,0,''],['BA',8,'7A–3P SH'],['BA',8,'6A–2P SH'],['BA',8,'6A–2P SH'],['BA',8,'6A–2P SH'],['BA',8,'6A–2P SH']]},
+  {id:52,name:'Ramos, Guadalupe',     dept:'rc_foh',      role:'Cashier / Lead', shifts:[['OFF',0,''],[''  ,0,''],['',8,''],['STW',8,'STANDWORKER'],['CA',8,'9:30A–5:30P'],['CA',8,'9:30A–5:30P'],['CA',8,'9:30A–5:30P']]},
+  {id:53,name:'Rojas, Maritza',       dept:'rc_foh',      role:'Cashier',        shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',8,''],['CA',6,'11A–7P GAL'],['CA',8,'11A–7P'],['',0,'']]},
+  {id:54,name:'Martinez, Beatriz',    dept:'rc_foh',      role:'Cashier',        shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',8,''],['CA',6,'1:15P–9:15P'],['CA',8,'12:15P–4:15P'],['',0,'']]},
+  {id:55,name:'Gomez, Andrea',        dept:'rc_foh',      role:'Cashier',        shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['',8,''],['CA',8,'9A–5P SH']]},
+  {id:56,name:'Aviles, Christian',    dept:'rc_foh',      role:'GW Cashier',     shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',8,'6A–2P WH'],['CA',8,'CANCELED'],['',0,''],['',0,'']]},
+  {id:57,name:'Lucero, Erica',        dept:'rc_foh',      role:'Stand Lead',     shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['LD',4,'4P–10P GAL'],['LD',6,'4P–8P GAL'],['LD',4,'4P–8P']]},
+  // ── STEWARDING ────────────────────────────────────────────────────────────
+  {id:60,name:'Ortiz, Silvia',        dept:'stewarding',  role:'Pantry / Steward',shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['P',8,'7A–3P COM'],['P',8,''],['OFF',0,'']]},
+  {id:61,name:'Herrarte, Evelyn',     dept:'stewarding',  role:'Steward',        shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['P',8,'7A–3P COM'],['P',8,'8A–4P'],['P',8,''],['OFF',0,'']]},
+  {id:62,name:'Martinez, Claudia S.', dept:'stewarding',  role:'Steward',        shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['P',8,'CANCEL'],['OFF',0,''],[''  ,0,''],[''  ,0,'']]},
+  {id:63,name:'Watson, Michael',      dept:'stewarding',  role:'Steward',        shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,'']]},
+  {id:64,name:'Mendez, Agustina',     dept:'stewarding',  role:'Steward',        shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,'']]},
+  // ── WAREHOUSE ─────────────────────────────────────────────────────────────
+  {id:70,name:'Bueno, Ernesto',       dept:'warehouse',   role:'Runner',         shifts:[['OFF',0,''],['R',8,'6A–2P'],['R',8,'5A–1P'],['R',8,'4A–12P'],['R',8,'4A–12P'],['R',8,''],['OFF',0,'']]},
+  {id:71,name:'Penate, Jose Luis',    dept:'warehouse',   role:'Runner',         shifts:[['OFF',0,''],['R',8,''],['OFF',0,''],['R',8,'9A–5P'],['R',8,'10A–6P'],['R',8,'6A–2P'],['R',8,'4A–12P']]},
+  {id:72,name:'Vega, Oscar',          dept:'warehouse',   role:'Runner',         shifts:[['AVAIL',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['R',8,''],['R',8,'']]},
+  {id:73,name:'Martinez, Javier',     dept:'warehouse',   role:'Barback / WH',   shifts:[['OFF',0,''],['',8,''],['OFF',0,''],['',6,'WHS'],['',8,'WHS'],['',8,'WHS'],['',8,'WHS']]},
+  {id:74,name:'Martinez, Carlos',     dept:'warehouse',   role:'Barback / WH',   shifts:[['OFF',0,''],['',8,''],['OFF',0,''],['',8,'WHS'],['',8,'WHS'],['',8,'WHS'],['',8,'DA']]},
+  {id:75,name:'Soto, Haroldo',        dept:'warehouse',   role:'Barback / DA',   shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',8,'DA'],['',8,'DA'],['',8,'DA'],['',8,'DA']]},
+  {id:76,name:'Geronimo, Eva',        dept:'warehouse',   role:'Barback',        shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',8,'DA'],['',8,'DA'],['',8,'12P–8P'],['',8,'']]},
+  // ── BARS ──────────────────────────────────────────────────────────────────
+  {id:80,name:'White, LaShawn',       dept:'bars',        role:'Bartender',      shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['C',6,'CANCELED'],['H',4,'12P–8P'],['C',8,'']]},
+  {id:81,name:'Aguayo, Esther',       dept:'bars',        role:'Bartender',      shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['C',8,'Dodgers'],  ['H',4,'12P–8P'],['C',8,'']]},
+  {id:82,name:'Aguayo, Nicholas',     dept:'bars',        role:'Bartender',      shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['C',6,'Dodgers'],  ['H',4,''],['',0,'']]},
+  {id:83,name:'Tilghman, Anthony',    dept:'bars',        role:'Bartender',      shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['C',8,'3:30P–7:30P'],['H',4,''],['',0,'']]},
+  {id:84,name:'Palma, Jose L.',       dept:'bars',        role:'Bartender',      shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['C',8,'CANCELED'],['H',4,''],['',0,'']]},
+  {id:85,name:'Diaz, Ana',            dept:'bars',        role:'Bartender',      shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['',0,''],           ['H',4,'12P–8P'],['',0,'']]},
+  {id:86,name:'Bachman, Craig',       dept:'bars',        role:'Bartender',      shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['C',6,'1P–9P'],    ['C',8,''],['',0,'']]},
+  {id:87,name:'Beech, Jeff',          dept:'bars',        role:'Bartender',      shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['C',6,'CANCELED'],['C',8,''],['',0,'']]},
+  {id:88,name:'Zych, Rebecca',        dept:'bars',        role:'Bartender',      shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['C',6,'PASS'],     ['',0,''],['',0,'']]},
+  {id:89,name:'Gomez, Aureliano',     dept:'bars',        role:'Bar Captain',    shifts:[['OFF',0,''],['',8,''],['OFF',0,''],['',8,'12P–8P'],['',8,'1P–9P'],['',8,'12P–8P'],['',8,'']]},
+  {id:90,name:'Morales, Jesus B.',    dept:'bars',        role:'Bar Captain',    shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,'']]},
+  {id:91,name:'Gonzalez, Apolinar',   dept:'bars',        role:'Barback',        shifts:[['OFF',0,''],['',8,''],['OFF',0,''],[''  ,0,''],['',8,'AVAIL'],['',8,''],['',8,'']]},
+  {id:92,name:'Sanchez, Matilde',     dept:'bars',        role:'Barback',        shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',8,'12P–8P'],['',8,'1P–9P'],['H',8,''],['',0,'']]},
+  {id:93,name:'Monterrosa, Sonia',    dept:'bars',        role:'Barback',        shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',8,'4P–10P'],['',6,'DA'],['',0,''],['',0,'']]},
+  {id:94,name:'Vilchis, Omar',        dept:'bars',        role:'Barback',        shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',8,'CANCELED'],['C',6,'CANCELED'],['',0,''],['',0,'']]},
+  {id:95,name:'Scholl, Mark',         dept:'bars',        role:'Barback',        shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['C',6,'CANCELED'],['H',4,''],['',0,'']]},
+  {id:96,name:'Blanco, Marlon',       dept:'bars',        role:'Barback',        shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['',0,''],['',0,''],['',0,'']]},
+  // ── ADMIN ─────────────────────────────────────────────────────────────────
+  {id:100,name:'Office Manager',      dept:'admin',       role:'Admin',          shifts:[['',0,''],['',0,''],['',0,''],['',0,''],['',0,''],['',0,''],['',0,'']]},
+  // ── GROUP SALES ───────────────────────────────────────────────────────────
+  {id:110,name:'Alas, Luee',          dept:'group_sales', role:'Lead Runner',    shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['',8,'4A–12P'],['',8,'4A–12P'],['CANCEL',0,'']]},
+  {id:111,name:'Quiroz, Sandra',      dept:'group_sales', role:'Lead Runner',    shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',8,'5A–1P SET UP'],['',8,'11A–7P'],['',8,'11A–7P'],['',8,'4A–12P']]},
+  {id:112,name:'Banega, Jorge',       dept:'group_sales', role:'Runner',         shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',8,'5A–1P'],['',8,'11A–7P'],['',8,'11A–7P'],['',8,'11A–7P']]},
+  {id:113,name:'Diaz, Jose Amado',    dept:'group_sales', role:'Runner',         shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',8,'5A–1P'],['',0,''],['',0,''],['',0,'']]},
+  {id:114,name:'Moradel, Juan J.',    dept:'group_sales', role:'Runner / Captain',shifts:[['OFF',0,''],[''  ,0,''],['',8,''],['',0,''],['',8,'5A–1P'],['',8,'6A–2P'],['',8,'6A–2P']]},
+  {id:115,name:'Lopez, Julio',        dept:'group_sales', role:'Captain / Server',shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['',0,''],['',8,'6A–2P'],['',8,'6A–2P']]},
+  {id:116,name:'Solis, Joel',         dept:'group_sales', role:'Captain',        shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['',8,'1P–9P'],['',0,'']]},
+  {id:117,name:'Yasuda, Kay',         dept:'group_sales', role:'Server',         shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['',8,'4A–12P'],['',8,'4A–12P'],['',8,'4A–12P']]},
+  {id:118,name:'Juarez, Rosario',     dept:'group_sales', role:'Server',         shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',8,''],['',8,'5A–1P'],['',8,'5A–1P'],['',8,'4A–12P']]},
+  {id:119,name:'Martinez, Guadalupe', dept:'group_sales', role:'Server',         shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',8,'12P–8P'],['',8,'5A–1P'],['',8,'5A–1P'],['',8,'6A–2P']]},
+  {id:120,name:'Macias, America',     dept:'group_sales', role:'Server',         shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],['',8,'12P–6P'],['',8,'6A–2P'],['',8,'9A–5P'],['',8,'5A–11A']]},
+  {id:121,name:'Chevez, Carlos',      dept:'group_sales', role:'Server',         shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['',0,''],['',8,'10A–6P'],['',8,'5A–11A']]},
+  {id:122,name:'Barahona, Juan',      dept:'group_sales', role:'Server',         shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['',0,''],['',8,'6A–2P'],['',8,'5A–11A']]},
+  {id:123,name:'Henriquez, Blanca',   dept:'group_sales', role:'Server',         shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['',0,''],['',8,'6A–2P'],['',8,'8A–4P']]},
+  {id:124,name:'Torres, Rogelio',     dept:'group_sales', role:'Runner',         shifts:[['OFF',0,''],[''  ,0,''],[''  ,0,''],[''  ,0,''],['',0,''],['',0,''],['',0,'']]},
+  {id:125,name:'Escalera, Rodrigo',   dept:'group_sales', role:'Runner',         shifts:[['OFF',0,''],[''  ,0,''],['',8,''],['',0,''],['',0,''],['',0,''],['',0,'']]},
+];
+
+// ─── MARCH 2026 DAILY DATA (from DECLINING B. file) ──────────────────────────
+// kitchen_prem = Premium Culinary daily forecast (parsed directly from file)
+// rc_kitchen   = R&C daily budget (from R&C section)
+// Others computed proportionally at runtime
+window.MARCH_DAYS = [
+  {date:'3/1', dow:'Sun', event:'Dark',                                  kp:{h:0,f:0},      rc:{h:0,   f:0}},
+  {date:'3/2', dow:'Sun', event:'Catersource / El Sembrador',            kp:{h:0,f:0},      rc:{h:25.2,f:630}},
+  {date:'3/3', dow:'Mon', event:'Catersource / Makeup LA',               kp:{h:0,f:0},      rc:{h:75.6,f:1890}},
+  {date:'3/4', dow:'Tue', event:'Catersource / Makeup LA',               kp:{h:48, f:1528}, rc:{h:47.6,f:1190}},
+  {date:'3/5', dow:'Wed', event:'Catersource / Makeup LA',               kp:{h:232,f:7214}, rc:{h:33.6,f:840}},
+  {date:'3/6', dow:'Thu', event:'Gymnastics / Hope Latina / Webcor',     kp:{h:272,f:8435}, rc:{h:89.6,f:2240}},
+  {date:'3/7', dow:'Fri', event:'Gymnastics',                            kp:{h:40, f:1233}, rc:{h:28,  f:700}},
+  {date:'3/8', dow:'Sat', event:'Black Men White Coats / CA Bridal',     kp:{h:0,f:0},      rc:{h:33.6,f:840}},
+  {date:'3/9', dow:'Sun', event:'CA Bridal',                             kp:{h:0,f:0},      rc:{h:25.2,f:630}},
+  {date:'3/10',dow:'Mon', event:'Dark',                                  kp:{h:8,  f:240},  rc:{h:0,   f:0}},
+  {date:'3/11',dow:'Tue', event:'Dark',                                  kp:{h:8,  f:240},  rc:{h:0,   f:0}},
+  {date:'3/12',dow:'Wed', event:'Dark',                                  kp:{h:88, f:2744}, rc:{h:0,   f:0}},
+  {date:'3/13',dow:'Thu', event:'Dark',                                  kp:{h:80, f:2500}, rc:{h:0,   f:0}},
+  {date:'3/14',dow:'Fri', event:'Dark',                                  kp:{h:96, f:2974}, rc:{h:0,   f:0}},
+  {date:'3/15',dow:'Sat', event:'Dark',                                  kp:{h:80, f:2500}, rc:{h:0,   f:0}},
+  {date:'3/16',dow:'Sun', event:'Dark',                                  kp:{h:96, f:3000}, rc:{h:0,   f:0}},
+  {date:'3/17',dow:'Mon', event:'Dark',                                  kp:{h:0,  f:0},    rc:{h:0,   f:0}},
+  {date:'3/18',dow:'Tue', event:'Optical Society',                       kp:{h:88, f:2746}, rc:{h:47.6,f:1190}},
+  {date:'3/19',dow:'Wed', event:'Optical Society',                       kp:{h:80, f:2500}, rc:{h:89.6,f:2240}},
+  {date:'3/20',dow:'Thu', event:'Optical Society',                       kp:{h:80, f:2500}, rc:{h:89.6,f:2240}},
+  {date:'3/21',dow:'Fri', event:'Dark',                                  kp:{h:128,f:3996}, rc:{h:28,  f:700}},
+  {date:'3/22',dow:'Sat', event:'Dark',                                  kp:{h:336,f:10427},rc:{h:89.6,f:2240}},
+  {date:'3/23',dow:'Sun', event:'Dark',                                  kp:{h:576,f:17754},rc:{h:89.6,f:2240}},
+  {date:'3/24',dow:'Mon', event:'Dark',                                  kp:{h:0,  f:0},    rc:{h:0,   f:0}},
+  {date:'3/25',dow:'Tue', event:'Dark',                                  kp:{h:0,  f:0},    rc:{h:0,   f:0}},
+  {date:'3/26',dow:'Wed', event:'Dark',                                  kp:{h:0,  f:0},    rc:{h:0,   f:0}},
+  {date:'3/27',dow:'Thu', event:'American Pharmacist',                   kp:{h:0,  f:0},    rc:{h:47.6,f:1190}},
+  {date:'3/28',dow:'Fri', event:'American Pharmacist',                   kp:{h:0,  f:0},    rc:{h:28,  f:700}},
+  {date:'3/29',dow:'Sat', event:'Gymnastics / Am. Pharm.',               kp:{h:0,  f:0},    rc:{h:89.6,f:2240}},
+  {date:'3/30',dow:'Sun', event:'Gymnastics / Am. Pharm.',               kp:{h:0,  f:0},    rc:{h:25.2,f:630}},
+  {date:'3/31',dow:'Mon', event:'Dark',                                  kp:{h:0,  f:0},    rc:{h:0,   f:0}},
+];
+
+window.LABOR_DATA = [
+  { dept:'kitchen_prem', budget:0,       forecast:72529,  label:'Prem Culinary'  },
+  { dept:'rc_kitchen',   budget:247000,  forecast:9925,   label:'R&C Culinary'   },
+  { dept:'rc_foh',       budget:175000,  forecast:14200,  label:'R&C FOH'        },
+  { dept:'stewarding',   budget:18500,   forecast:14200,  label:'Stewarding'     },
+  { dept:'warehouse',    budget:8000,    forecast:6300,   label:'Warehouse'      },
+  { dept:'bars',         budget:22000,   forecast:18400,  label:'Bars'           },
+  { dept:'admin',        budget:20000,   forecast:20000,  label:'Admin'          },
+  { dept:'group_sales',  budget:15000,   forecast:12000,  label:'Group Sales'    },
+];
+
+</script>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'Segoe UI',system-ui,sans-serif;background:#1C1E26;color:#E8EAF0;height:100vh;overflow:hidden;display:flex;flex-direction:column;}
+/* Shell */
+.app-header{background:#13151C;border-bottom:1px solid #2A2D3A;display:flex;align-items:center;height:52px;flex-shrink:0;padding:0 16px;gap:16px;}
+.app-logo{font-weight:800;font-size:15px;letter-spacing:.04em;color:#fff;white-space:nowrap;}
+.app-logo span{color:#E8890C;}
+.main-tabs{display:flex;gap:2px;}
+.main-tab{padding:6px 14px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;border:none;background:transparent;color:#8B8FA8;transition:all .15s;}
+.main-tab.active{background:#2A2D3A;color:#fff;}
+.main-tab:hover:not(.active){color:#C8CAD6;}
+.week-nav{display:flex;align-items:center;gap:8px;margin-left:auto;}
+.week-label{font-size:13px;font-weight:700;color:#fff;min-width:170px;text-align:center;}
+.nav-btn{width:28px;height:28px;border-radius:6px;border:1px solid #2A2D3A;background:#1C1E26;color:#8B8FA8;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:14px;transition:all .15s;}
+.nav-btn:hover{background:#2A2D3A;color:#fff;}
+.labor-toggle{margin-left:12px;padding:6px 12px;border-radius:6px;border:1px solid #2A2D3A;background:transparent;color:#8B8FA8;font-size:12px;font-weight:600;cursor:pointer;transition:all .15s;display:flex;align-items:center;gap:6px;}
+.labor-toggle.active{background:#E8890C22;border-color:#E8890C;color:#E8890C;}
+/* Body layout */
+.app-body{display:flex;flex:1;overflow:hidden;}
+/* Week summary bar */
+.week-summary{height:36px;background:#13151C;border-bottom:1px solid #2A2D3A;display:flex;align-items:center;padding:0 14px;gap:20px;flex-shrink:0;overflow-x:auto;}
+.ws-item{display:flex;align-items:center;gap:6px;white-space:nowrap;}
+.ws-label{font-size:10px;font-weight:700;color:#4A4D60;text-transform:uppercase;letter-spacing:.05em;}
+.ws-val{font-size:12px;font-weight:800;color:#E8EAF0;}
+.ws-divider{width:1px;height:20px;background:#2A2D3A;flex-shrink:0;}
+/* Dept sidebar */
+.dept-sidebar{width:155px;flex-shrink:0;background:#13151C;border-right:1px solid #2A2D3A;display:flex;flex-direction:column;padding:10px 8px;gap:3px;overflow-y:auto;}
+.dept-btn{padding:7px 10px;border-radius:8px;cursor:pointer;border:none;background:transparent;text-align:left;display:flex;align-items:center;gap:8px;transition:all .15s;width:100%;}
+.dept-btn .dot{width:9px;height:9px;border-radius:50%;flex-shrink:0;}
+.dept-btn .dept-name{font-size:11px;font-weight:600;line-height:1.2;}
+.dept-btn.active{background:#2A2D3A;}
+.dept-btn:hover:not(.active){background:#1F2130;}
+.dept-all-btn{padding:7px 10px;border-radius:8px;cursor:pointer;border:none;background:transparent;text-align:left;font-size:11px;font-weight:700;color:#8B8FA8;width:100%;margin-bottom:3px;transition:all .15s;}
+.dept-all-btn.active{background:#2A2D3A;color:#fff;}
+.dept-all-btn:hover:not(.active){background:#1F2130;color:#C8CAD6;}
+.dept-section-label{font-size:10px;font-weight:700;color:#4A4D60;letter-spacing:.08em;text-transform:uppercase;padding:6px 10px 3px;}
+/* Schedule grid */
+.schedule-area{flex:1;overflow:hidden;display:flex;flex-direction:column;}
+.grid-wrapper{flex:1;overflow:auto;}
+.schedule-table{border-collapse:collapse;width:100%;min-width:900px;}
+.schedule-table thead th{position:sticky;top:0;z-index:10;background:#13151C;border-bottom:2px solid #2A2D3A;padding:0;white-space:nowrap;}
+.th-name{width:175px;min-width:175px;padding:10px 14px;text-align:left;font-size:10px;font-weight:700;color:#4A4D60;letter-spacing:.06em;text-transform:uppercase;border-right:1px solid #2A2D3A;}
+.th-day{min-width:100px;padding:6px 8px;text-align:center;}
+.th-day-name{font-size:11px;font-weight:800;color:#E8EAF0;letter-spacing:.04em;}
+.th-day-date{font-size:10px;color:#6B6F85;margin-top:1px;}
+.th-day-event{font-size:9px;color:#4A4D60;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100px;}
+.th-total{width:56px;padding:10px 6px;text-align:center;font-size:10px;font-weight:700;color:#4A4D60;letter-spacing:.06em;border-left:1px solid #2A2D3A;}
+.section-row td{padding:7px 14px;font-size:10px;font-weight:800;letter-spacing:.07em;text-transform:uppercase;border-top:2px solid #2A2D3A;border-bottom:1px solid #2A2D3A;}
+.section-label{display:flex;align-items:center;gap:8px;}
+.section-count{font-size:10px;font-weight:600;opacity:.5;margin-left:4px;}
+.emp-row{border-bottom:1px solid #22253240;}
+.emp-row:hover{background:#1F2130;}
+.td-name{padding:5px 14px;border-right:1px solid #22253240;white-space:nowrap;position:sticky;left:0;background:#1C1E26;z-index:5;}
+.emp-row:hover .td-name{background:#1F2130;}
+.emp-name{font-size:12px;font-weight:600;color:#C8CAD6;}
+.emp-role{font-size:10px;color:#6B6F85;margin-top:1px;}
+.td-cell{padding:2px 3px;text-align:center;}
+.cell-inner{border-radius:6px;padding:3px 5px;cursor:pointer;transition:background .1s;min-height:42px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:1px;}
+.cell-inner:hover{background:#2A2D3A;}
+.cell-badge{font-size:10px;font-weight:800;padding:1px 5px;border-radius:4px;letter-spacing:.03em;}
+.cell-time{font-size:9px;color:#8B8FA8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:88px;}
+.cell-hours{font-size:9px;font-weight:700;color:#6B6F85;}
+.cell-off{color:#3A3D50;font-size:10px;font-weight:600;}
+.td-total{border-left:1px solid #22253240;padding:5px 6px;text-align:center;font-size:13px;font-weight:800;}
+/* Edit popup */
+.cell-edit-overlay{position:fixed;inset:0;z-index:100;}
+.cell-edit-popup{position:fixed;z-index:101;background:#252838;border:1px solid #3A3D50;border-radius:10px;padding:14px;width:220px;box-shadow:0 8px 32px #00000070;}
+.popup-title{font-size:11px;font-weight:700;color:#6B6F85;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px;}
+.popup-presets{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:10px;}
+.preset-btn{padding:3px 8px;border-radius:5px;font-size:11px;font-weight:700;cursor:pointer;border:1px solid #3A3D50;background:#1C1E26;color:#C8CAD6;transition:all .1s;}
+.preset-btn:hover,.preset-btn.sel{border-color:#E8890C;color:#E8890C;background:#E8890C11;}
+.popup-row{display:flex;flex-direction:column;gap:4px;margin-bottom:10px;}
+.popup-label{font-size:10px;font-weight:600;color:#6B6F85;}
+.popup-input{background:#1C1E26;border:1px solid #3A3D50;border-radius:6px;color:#E8EAF0;font-size:13px;padding:6px 10px;width:100%;outline:none;}
+.popup-input:focus{border-color:#E8890C;}
+.popup-actions{display:flex;gap:6px;}
+.popup-save{flex:1;padding:7px;border-radius:6px;border:none;background:#E8890C;color:#fff;font-size:12px;font-weight:700;cursor:pointer;}
+.popup-save:hover{background:#F09830;}
+.popup-cancel{padding:7px 10px;border-radius:6px;border:1px solid #3A3D50;background:transparent;color:#8B8FA8;font-size:12px;font-weight:700;cursor:pointer;}
+/* Labor panel */
+.labor-panel{width:300px;flex-shrink:0;background:#13151C;border-left:1px solid #2A2D3A;display:flex;flex-direction:column;overflow:hidden;}
+.lp-header{padding:12px 14px 8px;border-bottom:1px solid #2A2D3A;flex-shrink:0;}
+.lp-title{font-size:13px;font-weight:800;color:#fff;}
+.lp-subtitle{font-size:10px;color:#6B6F85;margin-top:2px;}
+.lp-body{flex:1;overflow-y:auto;padding:10px;}
+.lp-dept-row{padding:9px 11px;border-radius:8px;background:#1C1E26;margin-bottom:5px;border:1px solid #22253270;}
+.lp-dept-header{display:flex;align-items:center;gap:7px;margin-bottom:7px;}
+.lp-dept-dot{width:7px;height:7px;border-radius:50%;flex-shrink:0;}
+.lp-dept-name{font-size:11px;font-weight:700;flex:1;}
+.lp-dept-hrs{font-size:10px;color:#6B6F85;}
+.lp-bar-row{display:flex;align-items:center;gap:7px;margin-bottom:3px;}
+.lp-bar-label{font-size:9px;font-weight:700;color:#4A4D60;width:44px;text-transform:uppercase;letter-spacing:.04em;}
+.lp-bar-track{flex:1;height:5px;background:#2A2D3A;border-radius:3px;overflow:hidden;}
+.lp-bar-fill{height:100%;border-radius:3px;transition:width .3s;}
+.lp-bar-val{font-size:10px;font-weight:700;min-width:54px;text-align:right;}
+.lp-balance{margin-top:7px;padding:5px 8px;border-radius:6px;background:#252838;display:flex;justify-content:space-between;align-items:center;}
+.lp-balance-label{font-size:9px;color:#6B6F85;font-weight:600;}
+.lp-balance-val{font-size:12px;font-weight:800;}
+.pos{color:#16A34A;}.neg{color:#DC2626;}
+/* ── Daily Labor Tab ──────────────────────────────────────────────────── */
+.dl-view{flex:1;display:flex;flex-direction:column;overflow:hidden;}
+.dl-header{background:#13151C;border-bottom:1px solid #2A2D3A;padding:12px 18px;flex-shrink:0;display:flex;align-items:center;gap:20px;}
+.dl-header-title{font-size:14px;font-weight:800;color:#fff;}
+.dl-stat{display:flex;flex-direction:column;}
+.dl-stat-label{font-size:9px;font-weight:700;color:#4A4D60;text-transform:uppercase;letter-spacing:.06em;}
+.dl-stat-val{font-size:13px;font-weight:800;color:#E8EAF0;}
+.dl-body{flex:1;overflow:auto;padding:16px;}
+/* Events bar */
+.events-bar{display:flex;gap:0;margin-bottom:16px;border-radius:10px;overflow:hidden;border:1px solid #2A2D3A;}
+.event-day{flex:1;padding:8px 10px;background:#1C1E26;border-right:1px solid #2A2D3A;min-width:0;}
+.event-day:last-child{border-right:none;}
+.event-day-label{font-size:10px;font-weight:800;color:#E8EAF0;letter-spacing:.04em;}
+.event-day-date{font-size:9px;color:#6B6F85;margin-top:1px;}
+.event-day-name{font-size:10px;color:#8B8FA8;margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+/* Daily grid */
+.dl-table{width:100%;border-collapse:collapse;min-width:900px;}
+.dl-table th{position:sticky;top:0;z-index:5;background:#13151C;padding:8px 10px;font-size:10px;font-weight:700;color:#4A4D60;text-transform:uppercase;letter-spacing:.06em;text-align:center;border-bottom:2px solid #2A2D3A;white-space:nowrap;}
+.dl-table th.dept-col{text-align:left;min-width:120px;}
+.dl-table th.total-col{border-left:2px solid #2A2D3A;}
+.dl-td{padding:0;border-bottom:1px solid #22253240;vertical-align:top;}
+.dl-dept-cell{padding:10px 12px;border-right:2px solid #2A2D3A;}
+.dl-dept-name{font-size:12px;font-weight:700;}
+.dl-dept-role{font-size:10px;color:#6B6F85;margin-top:2px;}
+.dl-day-cell{padding:6px 8px;text-align:center;border-right:1px solid #22253240;}
+.dl-day-cell:last-child{border-right:none;}
+.dl-metric{display:flex;flex-direction:column;gap:2px;min-width:80px;}
+.dl-metric-row{display:flex;justify-content:space-between;align-items:center;padding:1px 3px;border-radius:3px;}
+.dl-metric-lbl{font-size:9px;font-weight:700;color:#4A4D60;text-transform:uppercase;letter-spacing:.04em;width:28px;}
+.dl-metric-val{font-size:10px;font-weight:700;}
+.dl-var-pos{color:#16A34A;}.dl-var-neg{color:#DC2626;}.dl-var-none{color:#4A4D60;}
+.dl-total-cell{padding:6px 10px;border-left:2px solid #2A2D3A;text-align:right;}
+.dl-total-hrs{font-size:13px;font-weight:800;color:#E8EAF0;}
+.dl-total-fcst{font-size:10px;color:#8B8FA8;margin-top:2px;}
+.dl-total-act{font-size:10px;font-weight:700;margin-top:1px;}
+/* Declining balance cards */
+.dl-balance-section{margin-top:18px;}
+.dl-balance-title{font-size:11px;font-weight:800;color:#4A4D60;text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;}
+.dl-balance-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:10px;}
+.dl-balance-card{background:#1C1E26;border:1px solid #2A2D3A;border-radius:10px;padding:12px 14px;}
+.dl-bc-header{display:flex;align-items:center;gap:8px;margin-bottom:10px;}
+.dl-bc-dot{width:10px;height:10px;border-radius:50%;}
+.dl-bc-name{font-size:12px;font-weight:700;flex:1;}
+.dl-bc-budget{font-size:11px;color:#6B6F85;}
+.dl-bc-bars{display:flex;flex-direction:column;gap:4px;}
+.dl-bc-bar-row{display:flex;align-items:center;gap:8px;}
+.dl-bc-label{font-size:9px;font-weight:700;color:#4A4D60;text-transform:uppercase;width:48px;}
+.dl-bc-track{flex:1;height:7px;background:#2A2D3A;border-radius:4px;overflow:hidden;}
+.dl-bc-fill{height:100%;border-radius:4px;transition:width .4s;}
+.dl-bc-value{font-size:11px;font-weight:700;min-width:64px;text-align:right;}
+.dl-bc-remaining{margin-top:8px;padding:6px 9px;border-radius:6px;background:#252838;display:flex;justify-content:space-between;align-items:center;}
+.dl-bc-rem-label{font-size:9px;font-weight:700;color:#6B6F85;text-transform:uppercase;letter-spacing:.04em;}
+.dl-bc-rem-val{font-size:14px;font-weight:900;}
+/* ── Import Tab ───────────────────────────────────────────────────────── */
+.import-view{flex:1;overflow:auto;padding:20px;}
+.import-layout{display:grid;grid-template-columns:1fr 1.4fr;gap:20px;max-width:1200px;}
+.import-card{background:#1C1E26;border:1px solid #2A2D3A;border-radius:12px;padding:18px;}
+.import-card-title{font-size:13px;font-weight:800;color:#fff;margin-bottom:6px;}
+.import-card-sub{font-size:12px;color:#6B6F85;margin-bottom:14px;line-height:1.6;}
+.import-steps{display:flex;flex-direction:column;gap:10px;margin-bottom:16px;}
+.import-step{display:flex;gap:10px;align-items:flex-start;}
+.step-num{width:22px;height:22px;border-radius:50%;background:#E8890C22;border:1px solid #E8890C44;color:#E8890C;font-size:11px;font-weight:800;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-top:1px;}
+.step-text{font-size:12px;color:#8B8FA8;line-height:1.5;}
+.step-text strong{color:#C8CAD6;}
+.cc-map{font-size:11px;color:#8B8FA8;line-height:1.8;background:#252838;border-radius:8px;padding:10px 12px;}
+.cc-map span{font-weight:700;color:#C8CAD6;margin-right:6px;}
+.import-textarea{width:100%;background:#13151C;border:1px solid #3A3D50;border-radius:8px;color:#C8CAD6;font-size:12px;font-family:monospace;padding:12px;outline:none;resize:vertical;min-height:160px;line-height:1.4;}
+.import-textarea:focus{border-color:#E8890C;}
+.import-actions{display:flex;gap:8px;margin-top:10px;}
+.import-btn{padding:8px 18px;border-radius:7px;border:none;background:#E8890C;color:#fff;font-size:13px;font-weight:700;cursor:pointer;}
+.import-btn:hover{background:#F09830;}
+.import-btn-sec{padding:8px 18px;border-radius:7px;border:1px solid #3A3D50;background:transparent;color:#8B8FA8;font-size:13px;font-weight:600;cursor:pointer;}
+.import-btn-sec:hover{border-color:#6B6F85;color:#C8CAD6;}
+.import-preview{margin-top:16px;}
+.import-preview-title{font-size:11px;font-weight:700;color:#4A4D60;text-transform:uppercase;letter-spacing:.06em;margin-bottom:10px;}
+.preview-table{width:100%;border-collapse:collapse;}
+.preview-table th{padding:6px 10px;font-size:10px;font-weight:700;color:#4A4D60;text-transform:uppercase;letter-spacing:.05em;border-bottom:2px solid #2A2D3A;text-align:left;}
+.preview-table td{padding:7px 10px;font-size:12px;border-bottom:1px solid #22253240;}
+.preview-table tr:hover td{background:#1F2130;}
+.import-success{display:flex;align-items:center;gap:8px;padding:10px 14px;border-radius:8px;background:#16A34A22;border:1px solid #16A34A44;color:#4ADE80;font-size:12px;font-weight:600;margin-top:12px;}
+.import-error{background:#DC262622;border-color:#DC262644;color:#F87171;}
+/* People view */
+.people-view{flex:1;overflow:auto;padding:20px;}
+.people-table{width:100%;border-collapse:collapse;}
+.people-table th{text-align:left;padding:7px 12px;font-size:10px;font-weight:700;color:#4A4D60;text-transform:uppercase;letter-spacing:.06em;border-bottom:2px solid #2A2D3A;background:#13151C;position:sticky;top:0;z-index:5;}
+.people-table td{padding:7px 12px;border-bottom:1px solid #22253240;font-size:12px;vertical-align:middle;}
+.people-table tr:hover td{background:#1F2130;}
+.dept-select{background:#1C1E26;border:1px solid #3A3D50;border-radius:6px;color:#E8EAF0;font-size:11px;padding:3px 7px;cursor:pointer;outline:none;}
+.dept-select:focus{border-color:#E8890C;}
+.role-input{background:transparent;border:1px solid transparent;border-radius:6px;color:#C8CAD6;font-size:12px;padding:3px 7px;width:130px;outline:none;}
+.role-input:focus{border-color:#3A3D50;background:#13151C;}
+.add-emp-row{display:flex;gap:8px;padding:14px 0 0;}
+.add-inp{background:#1C1E26;border:1px solid #3A3D50;border-radius:6px;color:#E8EAF0;font-size:12px;padding:7px 10px;outline:none;flex:1;}
+.add-inp:focus{border-color:#E8890C;}
+.add-btn{padding:7px 16px;border-radius:6px;border:none;background:#E8890C;color:#fff;font-size:12px;font-weight:700;cursor:pointer;}
+/* ── Declining Balance Tab ────────────────────────────────────────────── */
+.db-view{flex:1;display:flex;flex-direction:column;overflow:hidden;}
+.db-header{background:#13151C;border-bottom:1px solid #2A2D3A;padding:14px 18px;flex-shrink:0;}
+.db-title{font-size:14px;font-weight:800;color:#fff;margin-bottom:10px;}
+.db-summary{display:flex;gap:24px;align-items:flex-end;flex-wrap:wrap;}
+.db-big{display:flex;flex-direction:column;}
+.db-big-label{font-size:9px;font-weight:700;color:#4A4D60;text-transform:uppercase;letter-spacing:.08em;}
+.db-big-val{font-size:22px;font-weight:900;line-height:1;}
+.db-progress-bar{height:6px;background:#2A2D3A;border-radius:4px;overflow:hidden;margin-top:6px;width:200px;}
+.db-progress-fill{height:100%;border-radius:4px;transition:width .4s;}
+.db-dept-select{background:#1C1E26;border:1px solid #3A3D50;border-radius:7px;color:#E8EAF0;font-size:12px;font-weight:600;padding:7px 12px;outline:none;cursor:pointer;margin-left:auto;}
+.db-dept-select:focus{border-color:#E8890C;}
+.db-body{flex:1;overflow:auto;padding:16px;}
+.db-table{width:100%;border-collapse:collapse;min-width:700px;}
+.db-table th{position:sticky;top:0;z-index:5;background:#13151C;padding:7px 12px;font-size:10px;font-weight:700;color:#4A4D60;text-transform:uppercase;letter-spacing:.06em;text-align:left;border-bottom:2px solid #2A2D3A;white-space:nowrap;}
+.db-table th.num{text-align:right;}
+.db-row{border-bottom:1px solid #22253240;}
+.db-row:hover{background:#1F2130;}
+.db-row.future{opacity:.45;}
+.db-row.week-row{background:#E8890C08;}
+.db-row.has-actual-good{background:#16A34A08;}
+.db-row.has-actual-bad{background:#DC262608;}
+.db-td{padding:7px 12px;font-size:12px;vertical-align:middle;}
+.db-td.num{text-align:right;font-variant-numeric:tabular-nums;}
+.db-td.date{font-weight:700;color:#C8CAD6;white-space:nowrap;}
+.db-td.dow{color:#6B6F85;font-size:11px;width:36px;}
+.db-td.event{color:#8B8FA8;max-width:220px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.db-td.balance{font-weight:800;font-size:13px;}
+.db-var-pos{color:#4ADE80;}.db-var-neg{color:#F87171;}.db-var-zero{color:#4A4D60;}
+.db-balance-bar{width:80px;height:4px;background:#2A2D3A;border-radius:2px;overflow:hidden;display:inline-block;vertical-align:middle;margin-left:8px;}
+.db-balance-fill{height:100%;border-radius:2px;}
+/* ── Statistics Tab ───────────────────────────────────────────────────── */
+.stats-view{flex:1;overflow:auto;padding:18px;}
+.stats-section{margin-bottom:22px;}
+.stats-section-title{font-size:10px;font-weight:800;color:#4A4D60;text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px;}
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:10px;}
+.kpi-card{background:#1C1E26;border:1px solid #2A2D3A;border-radius:10px;padding:14px 16px;}
+.kpi-label{font-size:9px;font-weight:700;color:#4A4D60;text-transform:uppercase;letter-spacing:.08em;margin-bottom:6px;}
+.kpi-val{font-size:22px;font-weight:900;line-height:1;}
+.kpi-sub{font-size:10px;color:#6B6F85;margin-top:4px;}
+.kpi-badge{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;margin-top:6px;}
+.badge-green{background:#16A34A22;color:#4ADE80;}
+.badge-red{background:#DC262622;color:#F87171;}
+.badge-amber{background:#E8890C22;color:#E8890C;}
+/* Dept perf table */
+.perf-table{width:100%;border-collapse:collapse;}
+.perf-table th{padding:7px 12px;font-size:10px;font-weight:700;color:#4A4D60;text-transform:uppercase;letter-spacing:.05em;border-bottom:2px solid #2A2D3A;text-align:left;white-space:nowrap;}
+.perf-table th.r{text-align:right;}
+.perf-table td{padding:8px 12px;border-bottom:1px solid #22253240;font-size:12px;vertical-align:middle;}
+.perf-table tr:hover td{background:#1F2130;}
+.util-bar{width:100%;height:6px;background:#2A2D3A;border-radius:3px;overflow:hidden;margin-top:4px;}
+.util-fill{height:100%;border-radius:3px;transition:width .4s;}
+/* Day distribution */
+.day-dist{display:grid;grid-template-columns:40px 1fr 64px;gap:4px;align-items:center;}
+.day-dist-label{font-size:11px;font-weight:700;color:#8B8FA8;}
+.day-dist-track{height:24px;background:#2A2D3A;border-radius:4px;overflow:hidden;}
+.day-dist-fill{height:100%;border-radius:4px;display:flex;align-items:center;padding-left:8px;font-size:10px;font-weight:700;color:#fff;white-space:nowrap;overflow:hidden;}
+.day-dist-val{font-size:11px;font-weight:700;color:#E8EAF0;text-align:right;}
+.stats-two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px;}
+.stats-card{background:#1C1E26;border:1px solid #2A2D3A;border-radius:10px;padding:14px 16px;}
+.stats-card-title{font-size:11px;font-weight:800;color:#C8CAD6;margin-bottom:12px;}
+.insight-row{display:flex;align-items:center;gap:10px;padding:7px 0;border-bottom:1px solid #22253240;}
+.insight-row:last-child{border-bottom:none;}
+.insight-icon{font-size:16px;flex-shrink:0;}
+.insight-text{font-size:12px;color:#8B8FA8;flex:1;line-height:1.4;}
+.insight-text strong{color:#C8CAD6;}
+/* Print button */
+.print-btn{padding:5px 12px;border-radius:6px;border:1px solid #2A2D3A;background:transparent;color:#8B8FA8;font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:5px;transition:all .15s;}
+.print-btn:hover{background:#2A2D3A;color:#fff;}
+/* ── Budget Tab ────────────────────────────────────────────────────────── */
+.bg-view{flex:1;overflow:auto;padding:18px;}
+.bg-section{margin-bottom:22px;background:#1C1E26;border:1px solid #2A2D3A;border-radius:12px;padding:16px 18px;}
+.bg-title{font-size:12px;font-weight:800;color:#fff;margin-bottom:4px;}
+.bg-sub{font-size:11px;color:#6B6F85;margin-bottom:14px;line-height:1.5;}
+.bg-grid-2{display:grid;grid-template-columns:1.2fr 1fr;gap:16px;}
+.sales-table{width:100%;border-collapse:collapse;}
+.sales-table th{padding:7px 10px;font-size:10px;font-weight:700;color:#4A4D60;text-transform:uppercase;letter-spacing:.06em;border-bottom:2px solid #2A2D3A;text-align:right;white-space:nowrap;}
+.sales-table th:first-child,.sales-table th:nth-child(2){text-align:left;}
+.sales-table td{padding:5px 10px;border-bottom:1px solid #22253240;font-size:12px;}
+.sales-table td.num{text-align:right;font-variant-numeric:tabular-nums;}
+.sales-table tr.tot-row td{border-top:2px solid #3A3D50;font-weight:800;background:#13151C;font-size:13px;padding:8px 10px;}
+.sales-input{background:#252838;border:1px solid #3A3D50;border-radius:5px;color:#E8EAF0;font-size:12px;padding:4px 8px;width:100%;text-align:right;outline:none;font-variant-numeric:tabular-nums;}
+.sales-input:focus{border-color:#E8890C;background:#2A2D3A;}
+.pct-table{width:100%;border-collapse:collapse;}
+.pct-table th{padding:6px 10px;font-size:10px;font-weight:700;color:#4A4D60;text-transform:uppercase;letter-spacing:.06em;border-bottom:2px solid #2A2D3A;text-align:left;}
+.pct-table th.r{text-align:right;}
+.pct-table td{padding:7px 10px;border-bottom:1px solid #22253240;font-size:12px;vertical-align:middle;}
+.pct-table tr:hover td{background:#1F2130;}
+.pct-group-row td{background:#13151C;font-size:10px;font-weight:800;color:#6B6F85;text-transform:uppercase;letter-spacing:.08em;padding:6px 10px;border-top:1px solid #2A2D3A;}
+.pct-input{background:#252838;border:1px solid #3A3D50;border-radius:5px;color:#E8890C;font-size:12px;font-weight:700;padding:4px 6px;width:56px;text-align:right;outline:none;}
+.pct-input:focus{border-color:#E8890C;background:#2A2D3A;}
+.area-select{background:#252838;border:1px solid #3A3D50;border-radius:5px;color:#E8EAF0;font-size:11px;padding:3px 6px;outline:none;cursor:pointer;}
+.area-select:focus{border-color:#E8890C;}
+.bg-summary-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-top:12px;}
+.bg-summary-card{background:#13151C;border:1px solid #2A2D3A;border-radius:8px;padding:10px 12px;}
+.bg-sc-label{font-size:9px;font-weight:700;color:#4A4D60;text-transform:uppercase;letter-spacing:.05em;margin-bottom:4px;}
+.bg-sc-val{font-size:16px;font-weight:800;}
+.bg-sc-sub{font-size:10px;color:#6B6F85;margin-top:2px;}
+.bg-day-table{width:100%;border-collapse:collapse;font-size:11px;}
+.bg-day-table th{padding:6px 8px;font-size:9px;font-weight:700;color:#4A4D60;text-transform:uppercase;letter-spacing:.05em;border-bottom:2px solid #2A2D3A;text-align:right;white-space:nowrap;}
+.bg-day-table th:first-child,.bg-day-table th:nth-child(2),.bg-day-table th:nth-child(3){text-align:left;}
+.bg-day-table td{padding:5px 8px;border-bottom:1px solid #22253240;}
+.bg-day-table td.num{text-align:right;font-variant-numeric:tabular-nums;}
+.bg-day-table tr.tot-row td{border-top:2px solid #3A3D50;font-weight:800;background:#13151C;}
+.bg-chip{display:inline-block;padding:1px 6px;border-radius:8px;font-size:9px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;}
+.chip-premium{background:#E8890C22;color:#E8890C;}
+.chip-rc{background:#16A34A22;color:#4ADE80;}
+/* ── Archive / Month menu ───────────────────────────────────────────────── */
+.month-menu{display:flex;align-items:center;gap:8px;margin-left:10px;}
+.month-pill{background:#1C1E26;border:1px solid #2A2D3A;border-radius:6px;color:#E8EAF0;font-size:12px;font-weight:700;padding:5px 10px;cursor:pointer;outline:none;}
+.month-pill:focus{border-color:#E8890C;}
+.archive-menu{position:absolute;top:46px;right:14px;background:#252838;border:1px solid #3A3D50;border-radius:10px;box-shadow:0 8px 32px #00000080;z-index:500;min-width:240px;padding:6px;}
+.archive-item{padding:8px 12px;border-radius:6px;font-size:12px;color:#C8CAD6;cursor:pointer;display:flex;align-items:center;gap:8px;}
+.archive-item:hover{background:#1C1E26;color:#fff;}
+.archive-item.danger:hover{color:#F87171;}
+.archive-divider{height:1px;background:#3A3D50;margin:4px 6px;}
+.archive-hdr{padding:8px 12px;font-size:10px;font-weight:800;color:#6B6F85;text-transform:uppercase;letter-spacing:.06em;}
+/* Scrollbar */
+::-webkit-scrollbar{width:5px;height:5px;}
+::-webkit-scrollbar-track{background:#13151C;}
+::-webkit-scrollbar-thumb{background:#2A2D3A;border-radius:3px;}
+::-webkit-scrollbar-thumb:hover{background:#3A3D50;}
+@keyframes pulse { 0%,100%{opacity:1;transform:scale(1);} 50%{opacity:.55;transform:scale(.88);} }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useCallback, useRef, useEffect, useMemo } = React;
+const { DEPTS, COST_CENTER_MAP, mapCostCenter, DAYS, WEEK_DATES, WEEK_EVENTS,
+        WEEK_START_SERIAL, AVG_RATES, STATUS_COLORS, INIT_EMPLOYEES, LABOR_DATA,
+        DEPT_GROUPS, DEFAULT_BUDGET_CONFIG, MARCH_DAYS } = window;
+
+const getDept = id => DEPTS.find(d=>d.id===id)||DEPTS[0];
+const fmt$ = n => n===0?'—':'$'+Math.round(n).toLocaleString();
+const fmtH = n => n===0?'—':n+'h';
+
+// ── Week context — consumers re-render when active week changes ──
+const WeekContext = React.createContext(null);
+const useWeek = () => {
+  const ctx = React.useContext(WeekContext);
+  return ctx || { dates: window.WEEK_DATES, events: window.WEEK_EVENTS };
+};
+
+// ── Rate helpers ──────────────────────────────────────────────────────────
+// Shift tuple is [status, hours, time] with optional [flag, rateOverride].
+// flag values: '' | 'OT' (1.5x) | 'HOL' (2x)
+const getShiftFlag = sh => sh[3]||'';
+const getShiftRateOverride = sh => (sh[4]==null||sh[4]==='')?null:parseFloat(sh[4]);
+const getEmpRate = emp => emp.rate!=null ? parseFloat(emp.rate) : (AVG_RATES[emp.dept]||30);
+const getShiftCost = (emp, sh) => {
+  const hrs = sh[1]||0; if(!hrs) return 0;
+  const base = getShiftRateOverride(sh) ?? getEmpRate(emp);
+  const mult = sh[3]==='OT' ? 1.5 : sh[3]==='HOL' ? 2.0 : 1.0;
+  return hrs * base * mult;
+};
+const getEmpWeeklyCost = emp => emp.shifts.reduce((s,sh)=>s+getShiftCost(emp,sh),0);
+// Shift dept override: sh[5] = dept id string, or null = use emp's primary dept
+const getShiftDept = (emp, sh) => sh[5] || emp.dept;
+const getShiftDeptOv = sh => sh[5] || null;
+
+// ─── CellPopup ────────────────────────────────────────────────────────────────
+function CellPopup({ emp, dayIdx, onSave, onClose }) {
+  const { dates: WEEK_DATES, events: WEEK_EVENTS_CTX } = useWeek();
+  const WEEK_EVENTS = WEEK_EVENTS_CTX;
+  const shift = emp.shifts[dayIdx];
+  const [status, setStatus] = useState(shift[0]);
+  const [hours, setHours]   = useState(shift[1]||'');
+  const [time, setTime]     = useState(shift[2]||'');
+  const [flag, setFlag]     = useState(shift[3]||'');
+  const [rateOv, setRateOv] = useState(shift[4]==null?'':shift[4]);
+  const [deptOv, setDeptOv] = useState(shift[5]||'');
+  const presets = ['C','P','B','R','S','LD','CA','BA','STW','H','OFF','CANCEL','PASS','AVAIL'];
+  const baseRate = getEmpRate(emp);
+  const effRate = (rateOv!==''?parseFloat(rateOv):baseRate) * (flag==='OT'?1.5:flag==='HOL'?2.0:1.0);
+  const cost = (parseFloat(hours)||0) * effRate;
+  const save = () => {
+    const tuple = [status, parseFloat(hours)||0, time];
+    const hasAny = flag || rateOv!=='' || deptOv;
+    if (hasAny) {
+      tuple[3] = flag || '';
+      tuple[4] = rateOv===''?null:parseFloat(rateOv);
+      tuple[5] = deptOv || null;
+    }
+    onSave(emp.id, dayIdx, tuple); onClose();
+  };
+  return (
+    <>
+      <div className="cell-edit-overlay" onClick={onClose}/>
+      <div className="cell-edit-popup" style={{top:130,left:'50%',transform:'translateX(-50%)'}}>
+        <div className="popup-title">{emp.name} — {DAYS[dayIdx]} {WEEK_DATES[dayIdx][0]}</div>
+        <div className="popup-presets">
+          {presets.map(p=><button key={p} className={`preset-btn${status===p?' sel':''}`} onClick={()=>setStatus(p)}>{p}</button>)}
+        </div>
+        <div className="popup-row">
+          <label className="popup-label">Hours</label>
+          <input className="popup-input" type="number" min="0" max="24" step=".5" value={hours} onChange={e=>setHours(e.target.value)} placeholder="0"/>
+        </div>
+        <div className="popup-row">
+          <label className="popup-label">Shift Time</label>
+          <input className="popup-input" type="text" value={time} onChange={e=>setTime(e.target.value)} placeholder="e.g. 4A–12P"/>
+        </div>
+        <div style={{borderTop:'1px solid #2A2D3A',margin:'4px 0',paddingTop:8}}>
+          <div style={{fontSize:10,fontWeight:700,color:'#6B6F85',textTransform:'uppercase',letterSpacing:'.06em',marginBottom:6}}>Rate Flags</div>
+          <div className="popup-presets" style={{marginBottom:8}}>
+            {[['','Regular'],['OT','Overtime (1.5×)'],['HOL','Holiday (2×)']].map(([val,lbl])=>(
+              <button key={val} className={`preset-btn${flag===val?' sel':''}`} style={flag===val&&val==='OT'?{background:'#E8890C33',color:'#E8890C',borderColor:'#E8890C'}:flag===val&&val==='HOL'?{background:'#DC262633',color:'#F87171',borderColor:'#DC2626'}:{}} onClick={()=>setFlag(val)}>{lbl}</button>
+            ))}
+          </div>
+          <div className="popup-row">
+            <label className="popup-label">Rate Override</label>
+            <input className="popup-input" type="number" min="0" step=".25" value={rateOv} onChange={e=>setRateOv(e.target.value)} placeholder={`Default: $${baseRate.toFixed(2)}/hr`}/>
+          </div>
+          <div className="popup-row">
+            <label className="popup-label">Work Dept</label>
+            <select className="popup-input" value={deptOv} onChange={e=>setDeptOv(e.target.value)} style={{cursor:'pointer'}}>
+              <option value="">Primary: {getDept(emp.dept).label}</option>
+              {DEPTS.filter(d=>d.id!==emp.dept).map(d=><option key={d.id} value={d.id}>→ {d.label}</option>)}
+            </select>
+          </div>
+          <div style={{display:'flex',justifyContent:'space-between',padding:'4px 2px',fontSize:11,color:'#6B6F85'}}>
+            <span>Effective rate: <strong style={{color:flag==='OT'?'#E8890C':flag==='HOL'?'#F87171':'#E8EAF0'}}>${effRate.toFixed(2)}/hr</strong></span>
+            <span>Cost: <strong style={{color:'#E8EAF0'}}>{cost>0?fmt$(cost):'—'}</strong></span>
+          </div>
+        </div>
+        <div className="popup-actions">
+          <button className="popup-cancel" onClick={onClose}>Cancel</button>
+          <button className="popup-save" onClick={save}>Save</button>
+        </div>
+      </div>
+    </>
+  );
+}
+
+// ─── LaborPanel ───────────────────────────────────────────────────────────────
+function LaborPanel({ employees, laborData, actuals }) {
+  const { dates: WEEK_DATES, events: WEEK_EVENTS_CTX } = useWeek();
+  const WEEK_EVENTS = WEEK_EVENTS_CTX;
+  const actualHrsByDept = useMemo(()=>{
+    const m={};
+    employees.forEach(e=>{ const h=e.shifts.reduce((s,sh)=>s+(sh[1]||0),0); m[e.dept]=(m[e.dept]||0)+h; });
+    return m;
+  },[employees]);
+  return (
+    <div className="labor-panel">
+      <div className="lp-header"><div className="lp-title">Labor Budget — {window.ACTIVE_MONTH_LABEL||'March 2026'}</div><div className="lp-subtitle">Forecast vs. Actual by Department</div></div>
+      <div className="lp-body">
+        {laborData.map(ld=>{
+          const dept=getDept(ld.dept); const aHrs=actualHrsByDept[ld.dept]||0;
+          const rate=AVG_RATES[ld.dept]||30; const fcstWk=aHrs*rate;
+          const actAmt=actuals?.[ld.dept]?.total||0;
+          const base=Math.max(ld.budget,ld.forecast,actAmt,1);
+          const balance=ld.budget?(ld.budget-actAmt):(ld.forecast-actAmt);
+          return (
+            <div className="lp-dept-row" key={ld.dept}>
+              <div className="lp-dept-header">
+                <div className="lp-dept-dot" style={{background:dept.color}}/>
+                <span className="lp-dept-name" style={{color:dept.color}}>{dept.label}</span>
+                <span className="lp-dept-hrs">{aHrs}h</span>
+              </div>
+              {ld.budget>0 && <div className="lp-bar-row">
+                <span className="lp-bar-label">Budget</span>
+                <div className="lp-bar-track"><div className="lp-bar-fill" style={{width:`${Math.min(100,ld.budget/base*100)}%`,background:'#4A4D60'}}/></div>
+                <span className="lp-bar-val" style={{color:'#6B6F85'}}>{fmt$(ld.budget)}</span>
+              </div>}
+              <div className="lp-bar-row">
+                <span className="lp-bar-label">Forecast</span>
+                <div className="lp-bar-track"><div className="lp-bar-fill" style={{width:`${Math.min(100,ld.forecast/base*100)}%`,background:dept.color+'99'}}/></div>
+                <span className="lp-bar-val" style={{color:dept.color}}>{fmt$(ld.forecast)}</span>
+              </div>
+              <div className="lp-bar-row">
+                <span className="lp-bar-label">Actual</span>
+                <div className="lp-bar-track"><div className="lp-bar-fill" style={{width:`${Math.min(100,actAmt/base*100)}%`,background:dept.color}}/></div>
+                <span className="lp-bar-val" style={{color:'#E8EAF0'}}>{actAmt>0?fmt$(actAmt):'—'}</span>
+              </div>
+              <div className="lp-balance">
+                <span className="lp-balance-label">{ld.budget?'Remaining Budget':'vs Forecast'}</span>
+                <span className={`lp-balance-val ${balance>=0?'pos':'neg'}`}>{balance>=0?'+':''}{fmt$(Math.abs(balance))}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ─── ScheduleGrid ─────────────────────────────────────────────────────────────
+function ScheduleGrid({ employees, activeDept, onCellEdit }) {
+  const { dates: WEEK_DATES, events: WEEK_EVENTS_CTX } = useWeek();
+  const WEEK_EVENTS = WEEK_EVENTS_CTX;
+  const [editing, setEditing] = useState(null);
+  const groups = useMemo(()=>{
+    const vis = activeDept==='all'?employees:employees.filter(e=>e.dept===activeDept || e.shifts.some(sh=>sh[5]===activeDept));
+    // Group employees under a dept when they have either primary dept match OR any override shift to that dept
+    const m={}; DEPTS.forEach(d=>{m[d.id]=[];});
+    vis.forEach(e=>{
+      const depts = new Set([e.dept]);
+      e.shifts.forEach(sh=>{ if(sh[5]) depts.add(sh[5]); });
+      depts.forEach(d=>{ if(m[d]) m[d].push(e); });
+    });
+    return DEPTS.map(d=>({dept:d,emps:m[d.id]})).filter(g=>g.emps.length>0);
+  },[employees,activeDept]);
+  const todayCol = (new Date().getDay()+6)%7; // Mon=0
+  return (
+    <div className="grid-wrapper">
+      {editing && <CellPopup emp={employees.find(e=>e.id===editing.empId)} dayIdx={editing.dayIdx} onSave={onCellEdit} onClose={()=>setEditing(null)}/>}
+      <table className="schedule-table">
+        <thead><tr>
+          <th className="th-name">Employee</th>
+          {DAYS.map((d,i)=>(
+            <th key={d} className="th-day" style={i===todayCol?{background:'#E8890C18'}:{}}>
+              <div className="th-day-name">{d}</div>
+              <div className="th-day-date">{WEEK_DATES[i][0]}</div>
+              <div className="th-day-event">{WEEK_EVENTS[i]?.event}</div>
+            </th>
+          ))}
+          <th className="th-total">HRS</th>
+        </tr></thead>
+        <tbody>
+          {groups.map(({dept,emps})=>(
+            <React.Fragment key={dept.id}>
+              <tr className="section-row" style={{background:dept.light}}>
+                <td colSpan={9} style={{color:dept.color}}>
+                  <div className="section-label">
+                    <span style={{width:9,height:9,borderRadius:'50%',background:dept.color,display:'inline-block'}}/>
+                    {dept.label}<span className="section-count">{emps.length} staff</span>
+                  </div>
+                </td>
+              </tr>
+              {emps.map(emp=>{
+                // For this dept-section row: show only shifts assigned to this dept (primary with no override, or overridden to this dept)
+                const sectionShifts = emp.shifts.map(sh => {
+                  const shDept = sh[5] || emp.dept;
+                  return shDept === dept.id ? sh : ['',0,''];
+                });
+                const total=sectionShifts.reduce((s,sh)=>s+(sh[1]||0),0);
+                const isCrossover = emp.dept !== dept.id;
+                return (
+                  <tr key={emp.id+'@'+dept.id} className="emp-row">
+                    <td className="td-name">
+                      <div className="emp-name">{emp.name}{isCrossover&&<span style={{marginLeft:6,fontSize:8,fontWeight:800,color:getDept(emp.dept).color,background:getDept(emp.dept).color+'22',padding:'1px 5px',borderRadius:3,letterSpacing:'.04em',verticalAlign:'middle'}}>FROM {getDept(emp.dept).label.toUpperCase()}</span>}</div>
+                      <div className="emp-role">{emp.role}</div>
+                    </td>
+                    {sectionShifts.map((sh,di)=>{
+                      const [st,hrs,tm]=sh; const flag=sh[3]||''; const origSh=emp.shifts[di]; const shDept = origSh[5] || emp.dept;
+                      const sc=STATUS_COLORS[st]||STATUS_COLORS[''];
+                      const showDeptBadge = origSh[5] && origSh[5]===dept.id && origSh[1]>0;
+                      return (
+                        <td key={di} className="td-cell" style={di===todayCol?{background:'#E8890C08'}:{}}>
+                          <div className="cell-inner" onClick={()=>setEditing({empId:emp.id,dayIdx:di})}>
+                            {(!st||st==='')?<span className="cell-off">—</span>:
+                             st==='OFF'?<span className="cell-off">OFF</span>:(
+                              <><span className="cell-badge" style={{background:sc.bg,color:sc.color}}>{st}{flag==='OT'&&<span style={{fontSize:7,marginLeft:3,color:'#E8890C',fontWeight:900}}>OT</span>}{flag==='HOL'&&<span style={{fontSize:7,marginLeft:3,color:'#F87171',fontWeight:900}}>HOL</span>}</span>
+                              {tm&&<span className="cell-time">{tm}</span>}
+                              {hrs>0&&<span className="cell-hours" style={flag==='OT'?{color:'#E8890C',fontWeight:800}:flag==='HOL'?{color:'#F87171',fontWeight:800}:{}}>{hrs}h</span>}
+                              {showDeptBadge&&<span style={{fontSize:7,fontWeight:800,color:dept.color,marginTop:2,letterSpacing:'.04em'}}>◆ LOANED</span>}</>
+                            )}
+                          </div>
+                        </td>
+                      );
+                    })}
+                    <td className="td-total" style={{color:total>=40?'#16A34A':total>=32?'#E8890C':'#6B6F85'}}>{total>0?total:'—'}</td>
+                  </tr>
+                );
+              })}
+            </React.Fragment>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+// ─── DailyLaborView ───────────────────────────────────────────────────────────
+function DailyLaborView({ employees, laborData, actuals }) {
+  const { dates: WEEK_DATES, events: WEEK_EVENTS_CTX } = useWeek();
+  const WEEK_EVENTS = WEEK_EVENTS_CTX;
+  const [view, setView] = useState('$'); // '$' or 'h'
+
+  // Scheduled hours per dept per day
+  const schedHrs = useMemo(()=>{
+    const r={}; DEPTS.forEach(d=>{r[d.id]=Array(7).fill(0);});
+    employees.forEach(e=>{ e.shifts.forEach(([,h],di)=>{ if(h>0) r[e.dept][di]=(r[e.dept][di]||0)+h; }); });
+    return r;
+  },[employees]);
+
+  // Totals per day across all depts
+  const dayTotals = useMemo(()=>{
+    return Array(7).fill(0).map((_,di)=>{
+      const hrs=DEPTS.reduce((s,d)=>s+(schedHrs[d.id]?.[di]||0),0);
+      const fcst=DEPTS.reduce((s,d)=>s+(schedHrs[d.id]?.[di]||0)*(AVG_RATES[d.id]||30),0);
+      const act=DEPTS.reduce((s,d)=>s+(actuals?.[d.id]?.[di]?.amount||0),0);
+      return {hrs,fcst,act};
+    });
+  },[schedHrs,actuals]);
+
+  const weekTotals = useMemo(()=>({
+    hrs:DEPTS.reduce((s,d)=>s+(schedHrs[d.id]||[]).reduce((a,b)=>a+b,0),0),
+    fcst:laborData.reduce((s,l)=>s+l.forecast,0),
+    act:DEPTS.reduce((s,d)=>s+(actuals?.[d.id]?.total||0),0),
+  }),[schedHrs,actuals,laborData]);
+
+  return (
+    <div className="dl-view">
+      <div className="dl-header">
+        <div className="dl-header-title">Daily Labor — Week of Mar 23–29, 2026</div>
+        <div className="dl-stat"><span className="dl-stat-label">Total Sched Hrs</span><span className="dl-stat-val">{weekTotals.hrs}h</span></div>
+        <div className="dl-stat"><span className="dl-stat-label">Monthly Forecast</span><span className="dl-stat-val" style={{color:'#E8890C'}}>{fmt$(weekTotals.fcst)}</span></div>
+        <div className="dl-stat"><span className="dl-stat-label">MTD Actual</span><span className="dl-stat-val" style={{color:weekTotals.act>0?'#16A34A':'#6B6F85'}}>{weekTotals.act>0?fmt$(weekTotals.act):'Not imported'}</span></div>
+        <div style={{marginLeft:'auto',display:'flex',gap:4}}>
+          {['$','h'].map(v=><button key={v} onClick={()=>setView(v)} style={{padding:'5px 12px',borderRadius:6,border:'1px solid #3A3D50',background:view===v?'#2A2D3A':'transparent',color:view===v?'#fff':'#8B8FA8',cursor:'pointer',fontSize:12,fontWeight:700}}>{v==='$'?'Show $':'Show Hrs'}</button>)}
+        </div>
+      </div>
+      <div className="dl-body">
+        {/* Events banner */}
+        <div className="events-bar">
+          {DAYS.map((d,i)=>(
+            <div key={d} className="event-day" style={i===3||i===4?{background:'#6366F108'}:i===5||i===6?{background:'#06B6D408'}:{}}>
+              <div className="event-day-label">{d}</div>
+              <div className="event-day-date">{WEEK_DATES[i][0]}</div>
+              <div className="event-day-name">{WEEK_EVENTS[i]?.event}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Grid */}
+        <div style={{overflowX:'auto'}}>
+          <table className="dl-table">
+            <thead><tr>
+              <th className="dept-col">Department</th>
+              {DAYS.map((d,i)=><th key={d}>{d} <span style={{color:'#4A4D60',fontWeight:500}}>{WEEK_DATES[i][0]}</span></th>)}
+              <th className="total-col">Week Total</th>
+              <th>Monthly Fcst</th>
+              <th>MTD Actual</th>
+              <th>Remaining</th>
+            </tr></thead>
+            <tbody>
+              {DEPTS.map(dept=>{
+                const hrs=schedHrs[dept.id]||Array(7).fill(0);
+                const rate=AVG_RATES[dept.id]||30;
+                const ld=laborData.find(l=>l.dept===dept.id)||{};
+                const weekHrs=hrs.reduce((s,h)=>s+h,0);
+                const weekFcst=weekHrs*rate;
+                const actTotal=actuals?.[dept.id]?.total||0;
+                const remaining=(ld.budget||ld.forecast||0)-actTotal;
+                return (
+                  <tr key={dept.id} className="dl-td">
+                    <td className="dl-dept-cell">
+                      <div style={{display:'flex',alignItems:'center',gap:7}}>
+                        <div style={{width:10,height:10,borderRadius:'50%',background:dept.color,flexShrink:0}}/>
+                        <div><div className="dl-dept-name" style={{color:dept.color}}>{dept.label}</div>
+                          <div className="dl-dept-role">{weekHrs}h this week</div></div>
+                      </div>
+                    </td>
+                    {hrs.map((h,di)=>{
+                      const fcst=h*rate;
+                      const actD=actuals?.[dept.id]?.[di];
+                      const actAmt=actD?.amount||0;
+                      const actH=actD?.hours||0;
+                      const varAmt=actAmt-fcst;
+                      return (
+                        <td key={di} className="dl-td" style={{borderRight:'1px solid #22253240',padding:'6px 8px',textAlign:'center',background:actAmt>0&&varAmt>0?'#DC262608':actAmt>0&&varAmt<=0?'#16A34A08':'transparent'}}>
+                          {h===0&&!actAmt?<span style={{color:'#3A3D50',fontSize:11}}>—</span>:(
+                            <div className="dl-metric">
+                              <div className="dl-metric-row">
+                                <span className="dl-metric-lbl">Sched</span>
+                                <span className="dl-metric-val" style={{color:'#8B8FA8'}}>{view==='$'?fmt$(fcst):fmtH(h)}</span>
+                              </div>
+                              {actAmt>0 && <>
+                                <div className="dl-metric-row" style={{background:'#1C1E26',borderRadius:3}}>
+                                  <span className="dl-metric-lbl">Actual</span>
+                                  <span className="dl-metric-val" style={{color:'#E8EAF0'}}>{view==='$'?fmt$(actAmt):fmtH(actH)}</span>
+                                </div>
+                                <div className="dl-metric-row">
+                                  <span className="dl-metric-lbl">Var</span>
+                                  <span className={`dl-metric-val ${varAmt>0?'dl-var-neg':'dl-var-pos'}`}>{varAmt>0?'+':''}{view==='$'?fmt$(varAmt):fmtH(actH-h)}</span>
+                                </div>
+                              </>}
+                            </div>
+                          )}
+                        </td>
+                      );
+                    })}
+                    <td className="dl-total-cell">
+                      <div className="dl-total-hrs">{weekHrs}h</div>
+                      <div className="dl-total-fcst">{fmt$(weekFcst)}</div>
+                      {actTotal>0&&<div className="dl-total-act" style={{color:actTotal>weekFcst?'#F87171':'#4ADE80'}}>{fmt$(actTotal)}</div>}
+                    </td>
+                    <td style={{padding:'6px 10px',textAlign:'right',fontSize:12,fontWeight:700,color:'#E8890C'}}>{fmt$(ld.forecast)}</td>
+                    <td style={{padding:'6px 10px',textAlign:'right',fontSize:12,fontWeight:700,color:actTotal>0?'#E8EAF0':'#4A4D60'}}>{actTotal>0?fmt$(actTotal):'—'}</td>
+                    <td style={{padding:'6px 10px',textAlign:'right',fontSize:13,fontWeight:800}}
+                      className={remaining>=0?'pos':'neg'}>{remaining!==0?(remaining>=0?'+':'')+fmt$(Math.abs(remaining)):'—'}</td>
+                  </tr>
+                );
+              })}
+              {/* Totals row */}
+              <tr style={{borderTop:'2px solid #2A2D3A',background:'#13151C'}}>
+                <td className="dl-dept-cell" style={{fontWeight:800,fontSize:12,color:'#fff'}}>TOTAL</td>
+                {dayTotals.map((dt,di)=>(
+                  <td key={di} style={{padding:'8px 8px',textAlign:'center',borderRight:'1px solid #22253240'}}>
+                    <div style={{fontSize:12,fontWeight:800,color:'#E8EAF0'}}>{dt.hrs>0?(view==='$'?fmt$(dt.fcst):dt.hrs+'h'):'—'}</div>
+                    {dt.act>0&&<div style={{fontSize:10,color:'#4ADE80',marginTop:2}}>{view==='$'?fmt$(dt.act):dt.act+'h'}</div>}
+                  </td>
+                ))}
+                <td className="dl-total-cell" style={{fontSize:14,fontWeight:900,color:'#E8EAF0'}}>{weekTotals.hrs}h<div style={{fontSize:10,color:'#E8890C'}}>{fmt$(weekTotals.fcst)}</div></td>
+                <td style={{padding:'8px 10px',textAlign:'right',fontSize:13,fontWeight:800,color:'#E8890C'}}>{fmt$(weekTotals.fcst)}</td>
+                <td style={{padding:'8px 10px',textAlign:'right',fontSize:13,fontWeight:800,color:weekTotals.act>0?'#E8EAF0':'#4A4D60'}}>{weekTotals.act>0?fmt$(weekTotals.act):'—'}</td>
+                <td style={{padding:'8px 10px',textAlign:'right',fontSize:14,fontWeight:900}} className={weekTotals.act>0?(weekTotals.fcst-weekTotals.act>=0?'pos':'neg'):''}>{weekTotals.act>0?fmt$(weekTotals.fcst-weekTotals.act):'—'}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        {/* Declining Balance Cards */}
+        <div className="dl-balance-section">
+          <div className="dl-balance-title">Declining Balance — {window.ACTIVE_MONTH_LABEL||'March 2026'}</div>
+          <div className="dl-balance-grid">
+            {laborData.map(ld=>{
+              const dept=getDept(ld.dept);
+              const actTotal=actuals?.[ld.dept]?.total||0;
+              const base=Math.max(ld.budget||ld.forecast,ld.forecast,actTotal,1);
+              const remaining=(ld.budget||ld.forecast)-actTotal;
+              return (
+                <div className="dl-balance-card" key={ld.dept}>
+                  <div className="dl-bc-header">
+                    <div className="dl-bc-dot" style={{background:dept.color}}/>
+                    <span className="dl-bc-name" style={{color:dept.color}}>{dept.label}</span>
+                    <span className="dl-bc-budget" style={{fontSize:11}}>{ld.budget>0?`Budget: ${fmt$(ld.budget)}`:'Forecast Only'}</span>
+                  </div>
+                  <div className="dl-bc-bars">
+                    {ld.budget>0&&<div className="dl-bc-bar-row">
+                      <span className="dl-bc-label">Budget</span>
+                      <div className="dl-bc-track"><div className="dl-bc-fill" style={{width:'100%',background:'#4A4D60'}}/></div>
+                      <span className="dl-bc-value" style={{color:'#6B6F85'}}>{fmt$(ld.budget)}</span>
+                    </div>}
+                    <div className="dl-bc-bar-row">
+                      <span className="dl-bc-label">Forecast</span>
+                      <div className="dl-bc-track"><div className="dl-bc-fill" style={{width:`${Math.min(100,ld.forecast/base*100)}%`,background:dept.color+'88'}}/></div>
+                      <span className="dl-bc-value" style={{color:dept.color}}>{fmt$(ld.forecast)}</span>
+                    </div>
+                    <div className="dl-bc-bar-row">
+                      <span className="dl-bc-label">Actual</span>
+                      <div className="dl-bc-track"><div className="dl-bc-fill" style={{width:`${Math.min(100,actTotal/base*100)}%`,background:dept.color}}/></div>
+                      <span className="dl-bc-value" style={{color:'#E8EAF0'}}>{actTotal>0?fmt$(actTotal):'—'}</span>
+                    </div>
+                  </div>
+                  <div className="dl-bc-remaining">
+                    <span className="dl-bc-rem-label">Remaining</span>
+                    <span className={`dl-bc-rem-val ${remaining>=0?'pos':'neg'}`}>{remaining>=0?'+':''}{fmt$(Math.abs(remaining))}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── ImportView ───────────────────────────────────────────────────────────────
+function ImportView({ onApply, actuals, activeWeek }) {
+  const { dates: WEEK_DATES, events: WEEK_EVENTS_CTX } = useWeek();
+  const WEEK_EVENTS = WEEK_EVENTS_CTX;
+  const [text, setText]       = useState('');
+  const [parsed, setParsed]   = useState(null);
+  const [msg, setMsg]         = useState(null); // {type:'ok'|'err', text}
+  const fileRef = useRef();
+
+  const parseData = (raw) => {
+    const lines = raw.trim().split('\n').filter(l=>l.trim());
+    let headerIdx = lines.findIndex(l=>l.includes('Per No') || l.includes('Work Cost Center'));
+    const dataLines = headerIdx>=0 ? lines.slice(headerIdx+1) : lines;
+    const records=[]; let skipped=0, outOfMonth=0;
+    // Compute active-month serial range from buildMonth output
+    const AM = window.ACTIVE_MONTH || {year:2026, month:3};
+    const monthStart = new Date(AM.year, AM.month-1, 1);
+    const monthEnd   = new Date(AM.year, AM.month, 0);
+    const MONTH_START_SERIAL = window.dateToSerial(monthStart);
+    const MONTH_END_SERIAL   = window.dateToSerial(monthEnd);
+    dataLines.forEach(line=>{
+      const cols = line.split('\t');
+      if(cols.length < 20) { skipped++; return; }
+      const name=cols[1]?.trim(), cc=cols[11]?.trim(), wd=cols[12]?.trim();
+      const hrs=parseFloat(cols[18])||0, amt=parseFloat(cols[19])||0;
+      const dateSerial=parseFloat(cols[20]);
+      if(!cc||isNaN(dateSerial)) { skipped++; return; }
+      const dept=mapCostCenter(cc,wd);
+      if(!dept) { skipped++; return; }
+      const serialInt = Math.round(dateSerial);
+      if (serialInt < MONTH_START_SERIAL || serialInt > MONTH_END_SERIAL) { outOfMonth++; return; }
+      const monthDay = serialInt - MONTH_START_SERIAL + 1;
+      let wkId=null, dayIdx=null;
+      for (const wk of (window.WEEKS||[])) {
+        const i = wk.dayIdx.indexOf(monthDay);
+        if (i>=0) { wkId=wk.id; dayIdx=i; break; }
+      }
+      records.push({
+        name, dept, hours:hrs, amount:amt, cc,
+        monthDay, wkId, dayIdx,
+        date: `${AM.month}/${monthDay}`,
+      });
+    });
+    if(!records.length) { setMsg({type:'err',text:`No matching records found. Ensure you're pasting from the One & Done report (tab-separated). Skipped ${skipped} rows${outOfMonth?`, ${outOfMonth} outside ${window.ACTIVE_MONTH_LABEL||'current month'}`:''}.`}); return; }
+    // Group by week → dept → dayIdx (for per-week dashboard summaries)
+    const byWeek = {};
+    records.forEach(r=>{
+      if (!r.wkId) return;
+      if(!byWeek[r.wkId]) byWeek[r.wkId] = {};
+      const g = byWeek[r.wkId];
+      if(!g[r.dept]) g[r.dept]={};
+      if(!g[r.dept][r.dayIdx]) g[r.dept][r.dayIdx]={hours:0,amount:0,count:0};
+      g[r.dept][r.dayIdx].hours += r.hours;
+      g[r.dept][r.dayIdx].amount += r.amount;
+      g[r.dept][r.dayIdx].count++;
+    });
+    Object.values(byWeek).forEach(g=>{
+      Object.keys(g).forEach(d=>{
+        g[d].total = Object.values(g[d]).reduce((s,v)=>s+(v.amount||0),0);
+        g[d].totalHrs = Object.values(g[d]).filter(v=>typeof v==='object').reduce((s,v)=>s+(v.hours||0),0);
+      });
+    });
+    // Also keep the old "grouped" for the active week — that's what feeds the Daily Labor dashboard preview below
+    const grouped = byWeek[activeWeek] || Object.values(byWeek)[0] || {};
+    const weekCount = Object.keys(byWeek).length;
+    const dayRange = records.reduce((r,rec)=>({min:Math.min(r.min,rec.monthDay),max:Math.max(r.max,rec.monthDay)}),{min:32,max:0});
+    setParsed({grouped, byWeek, records, skipped, outOfMonth, total:records.length, weekCount, dayRange});
+    setMsg({type:'ok',text:`Parsed ${records.length} records · ${dayRange.min>dayRange.max?'no dates':'3/'+dayRange.min+'–3/'+dayRange.max} · ${weekCount} week${weekCount>1?'s':''} · ${Object.keys(grouped).length} depts. Click Apply.`});
+  };
+
+  const handleFile = e => {
+    const f=e.target.files?.[0]; if(!f) return;
+    const reader=new FileReader();
+    reader.onload = ev => { setText(ev.target.result); parseData(ev.target.result); };
+    reader.readAsText(f);
+  };
+
+  const apply = () => {
+    if(!parsed) return;
+    onApply(parsed.grouped, parsed.records);
+    setMsg({type:'ok',text:`✓ Applied ${parsed.total} records to Daily Labor dashboard.`});
+    setParsed(null); setText('');
+  };
+
+  // Summary table from parsed data
+  const summaryRows = useMemo(()=>{
+    if(!parsed) return [];
+    return DEPTS.map(dept=>{
+      const d=parsed.grouped[dept.id];
+      if(!d) return null;
+      const days=Array(7).fill(0).map((_,i)=>d[i]?.amount||0);
+      return {dept,days,total:d.total||0,totalHrs:d.totalHrs||0};
+    }).filter(Boolean);
+  },[parsed]);
+
+  return (
+    <div className="import-view">
+      <div className="import-layout">
+        {/* Instructions */}
+        <div>
+          <div className="import-card">
+            <div className="import-card-title">Import One &amp; Done Report</div>
+            <div className="import-card-sub">Actual labor data from payroll that feeds into the declining balance. Column L (Work Cost Center) maps each record to a department.</div>
+            <div className="import-steps">
+              <div className="import-step"><div className="step-num">1</div><div className="step-text">Open the <strong>One &amp; Done Report</strong> in Excel</div></div>
+              <div className="import-step"><div className="step-num">2</div><div className="step-text">Select <strong>all data rows</strong> (including header row 10) → Copy</div></div>
+              <div className="import-step"><div className="step-num">3</div><div className="step-text">Paste into the field on the right, or upload the <strong>.xlsx or .csv</strong> file directly</div></div>
+              <div className="import-step"><div className="step-num">4</div><div className="step-text">Click <strong>Parse &amp; Preview</strong>, review the summary, then click <strong>Apply</strong></div></div>
+            </div>
+            <div className="import-card-title" style={{marginBottom:8}}>Cost Center → Department</div>
+            <div className="cc-map">
+              {[['33416','Group Sales'],['33417 BOH','Kitchen Prem'],['33417','R&C Kitchen'],['33418','R&C FOH'],['33421','Bars'],['33422 BOH','Stewarding'],['33422','Admin'],['55936','Warehouse']].map(([cc,dept])=>(
+                <div key={cc}><span>{cc}</span>→ {dept}</div>
+              ))}
+            </div>
+          </div>
+          {actuals && Object.keys(actuals).length>0 && (
+            <div className="import-card" style={{marginTop:12}}>
+              <div className="import-card-title">Currently Imported</div>
+              {DEPTS.map(d=>{
+                const total=actuals[d.id]?.total||0;
+                if(!total) return null;
+                return <div key={d.id} style={{display:'flex',justifyContent:'space-between',padding:'5px 0',borderBottom:'1px solid #2A2D3A',fontSize:12}}>
+                  <span style={{color:d.color}}>{d.label}</span>
+                  <span style={{fontWeight:700}}>{fmt$(total)}</span>
+                </div>;
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* Paste/upload area */}
+        <div>
+          <div className="import-card">
+            <div className="import-card-title">Paste Data</div>
+            <textarea className="import-textarea" value={text} onChange={e=>{setText(e.target.value);setMsg(null);setParsed(null);}} placeholder="Copy all rows from the One &amp; Done Report in Excel and paste here (Ctrl+V / Cmd+V)&#10;&#10;Expected columns: Per No | Emp Full Name | ... | Work Cost Center (L) | Work Desc (M) | ... | Work Hours (S) | Ext Amount (T) | Work Date (U)"/>
+            <div className="import-actions">
+              <button className="import-btn" onClick={()=>parseData(text)} disabled={!text.trim()}>Parse &amp; Preview</button>
+              <button className="import-btn-sec" onClick={()=>fileRef.current.click()}>Upload File (.csv/.txt)</button>
+              <input ref={fileRef} type="file" accept=".csv,.txt,.tsv" style={{display:'none'}} onChange={handleFile}/>
+              {text&&<button className="import-btn-sec" onClick={()=>{setText('');setParsed(null);setMsg(null);}}>Clear</button>}
+            </div>
+            {msg&&<div className={`import-success${msg.type==='err'?' import-error':''}`}>{msg.text}</div>}
+          </div>
+
+          {/* Multi-week summary */}
+          {parsed && parsed.byWeek && Object.keys(parsed.byWeek).length > 0 && (
+            <div className="import-card" style={{marginTop:12}}>
+              <div className="import-preview-title">Summary by Week</div>
+              <div style={{display:'flex',flexDirection:'column',gap:6,fontSize:12}}>
+                {(window.WEEKS||[]).map(wk => {
+                  const g = parsed.byWeek[wk.id]; if (!g) return null;
+                  const hrs = Object.values(g).reduce((s,d)=>s+(d.totalHrs||0),0);
+                  const amt = Object.values(g).reduce((s,d)=>s+(d.total||0),0);
+                  const depts = Object.keys(g).length;
+                  const isActive = wk.id === activeWeek;
+                  return <div key={wk.id} style={{display:'flex',justifyContent:'space-between',padding:'6px 10px',background:isActive?'#E8890C15':'#1C1E26',border:'1px solid '+(isActive?'#E8890C66':'#2A2D3A'),borderRadius:6}}>
+                    <span style={{fontWeight:700,color:isActive?'#E8890C':'#C8CAD6'}}>{wk.label}{isActive&&<span style={{fontSize:9,marginLeft:6,letterSpacing:'.05em'}}>← ACTIVE</span>}</span>
+                    <span style={{color:'#8B8FA8'}}><strong style={{color:'#E8EAF0'}}>{hrs.toFixed(0)}h</strong> · <strong style={{color:'#E8890C'}}>{fmt$(amt)}</strong> · {depts} dept{depts!==1?'s':''}</span>
+                  </div>;
+                })}
+              </div>
+              <div style={{marginTop:10,padding:'8px 10px',background:'#0F172A',border:'1px solid #2563EB44',borderRadius:6,fontSize:11,color:'#93C5FD'}}>
+                <strong>Applying will replace actuals for 3/{parsed.dayRange.min}–3/{parsed.dayRange.max}.</strong> Previously imported days outside this range are preserved.
+              </div>
+            </div>
+          )}
+
+          {/* Preview table */}
+          {summaryRows.length>0 && (
+            <div className="import-card" style={{marginTop:12}}>
+              <div className="import-preview-title">Preview — Actuals by Department &amp; Day</div>
+              <div style={{overflowX:'auto'}}>
+                <table className="preview-table">
+                  <thead><tr>
+                    <th>Department</th>
+                    {DAYS.map((d,i)=><th key={d}>{d}<div style={{color:'#4A4D60',fontWeight:400}}>{WEEK_DATES[i][0]}</div></th>)}
+                    <th>Total Hrs</th><th>Total $</th>
+                  </tr></thead>
+                  <tbody>
+                    {summaryRows.map(({dept,days,total,totalHrs})=>(
+                      <tr key={dept.id}>
+                        <td><span style={{color:dept.color,fontWeight:700}}>{dept.label}</span></td>
+                        {days.map((amt,i)=><td key={i} style={{color:amt>0?'#E8EAF0':'#4A4D60'}}>{amt>0?fmt$(amt):'—'}</td>)}
+                        <td style={{fontWeight:700,color:'#E8EAF0'}}>{totalHrs>0?totalHrs+'h':'—'}</td>
+                        <td style={{fontWeight:800,color:'#E8890C'}}>{fmt$(total)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+              <div className="import-actions" style={{marginTop:12}}>
+                <button className="import-btn" onClick={apply}>Apply to Daily Labor Dashboard</button>
+              </div>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── PeopleView ───────────────────────────────────────────────────────────────
+function PeopleView({ employees, onUpdate, budgetCfg }) {
+  const [filter, setFilter] = useState('');
+  const [newName, setNewName] = useState('');
+  const [newDept, setNewDept] = useState('kitchen_prem');
+  const [newRole, setNewRole] = useState('');
+  const plans = budgetCfg.hwPlans || { b:{name:'B Plan'}, v:{name:'V Plan'} };
+  const defaultPlan = budgetCfg.defaultPlan || 'b';
+  const filtered = employees.filter(e=>(e.name+' '+e.role).toLowerCase().includes(filter.toLowerCase()));
+  const addEmp = () => {
+    if(!newName.trim()) return;
+    onUpdate([...employees,{id:Date.now(),name:newName.trim(),dept:newDept,role:newRole.trim()||'Staff',plan:defaultPlan,shifts:Array(7).fill(['',0,''])}]);
+    setNewName(''); setNewRole('');
+  };
+  return (
+    <div className="people-view">
+      <div style={{display:'flex',gap:10,marginBottom:14,alignItems:'center'}}>
+        <input className="add-inp" style={{maxWidth:260}} placeholder="🔍  Search…" value={filter} onChange={e=>setFilter(e.target.value)}/>
+        <span style={{fontSize:11,color:'#6B6F85',marginLeft:'auto'}}>{filtered.length} / {employees.length} employees</span>
+      </div>
+      <table className="people-table">
+        <thead><tr><th>Name</th><th>Department</th><th>Role</th><th style={{width:100}}>Rate $/hr</th><th style={{width:110}}>H&amp;W Plan</th><th>Sched Hrs</th><th>Wk Cost</th><th/></tr></thead>
+        <tbody>
+          {filtered.map(e=>{
+            const d=getDept(e.dept); const hrs=e.shifts.reduce((s,sh)=>s+(sh[1]||0),0);
+            const rate=getEmpRate(e); const wkCost=hrs*rate;
+            const isDefault=e.rate==null||e.rate==='';
+            return (
+              <tr key={e.id}>
+                <td style={{fontWeight:600,color:'#C8CAD6'}}>{e.name}</td>
+                <td><select className="dept-select" value={e.dept} onChange={ev=>onUpdate(employees.map(x=>x.id===e.id?{...x,dept:ev.target.value}:x))} style={{borderColor:d.color+'88',color:d.color}}>
+                  {DEPTS.map(dep=><option key={dep.id} value={dep.id}>{dep.label}</option>)}
+                </select></td>
+                <td><input className="role-input" value={e.role} onChange={ev=>onUpdate(employees.map(x=>x.id===e.id?{...x,role:ev.target.value}:x))}/></td>
+                <td>
+                  <input className="role-input" type="number" step="0.25" min="0" placeholder={`${AVG_RATES[e.dept]||30} (dept)`}
+                    value={e.rate==null?'':e.rate}
+                    onChange={ev=>onUpdate(employees.map(x=>x.id===e.id?{...x,rate:ev.target.value===''?null:parseFloat(ev.target.value)}:x))}
+                    style={{width:80,color:isDefault?'#6B6F85':'#4ADE80',fontStyle:isDefault?'italic':'normal',fontWeight:isDefault?400:700}}/>
+                </td>
+                <td>
+                  <div style={{display:'inline-flex',background:'#1C1E26',border:'1px solid #2A2D3A',borderRadius:5,overflow:'hidden'}}>
+                    {Object.keys(plans).map(pk=>{
+                      const active = (e.plan||defaultPlan)===pk;
+                      const isB = pk==='b';
+                      return <button key={pk}
+                        onClick={()=>onUpdate(employees.map(x=>x.id===e.id?{...x,plan:pk}:x))}
+                        style={{background:active?(isB?'#2563EB33':'#D97757aa'):'transparent',color:active?(isB?'#93C5FD':'#fff'):'#6B6F85',border:'none',padding:'5px 11px',fontSize:10,fontWeight:800,cursor:'pointer',letterSpacing:'.05em',textTransform:'uppercase'}}>
+                        {plans[pk].name.replace(/\s*plan\s*/i,'').trim() || pk.toUpperCase()}
+                      </button>;
+                    })}
+                  </div>
+                </td>
+                <td style={{fontWeight:700,color:hrs>=40?'#16A34A':hrs>=32?'#E8890C':'#6B6F85'}}>{hrs>0?hrs+'h':'—'}</td>
+                <td style={{fontWeight:700,color:'#8B8FA8'}}>{wkCost>0?fmt$(wkCost):'—'}</td>
+                <td><button onClick={()=>onUpdate(employees.filter(x=>x.id!==e.id))} style={{background:'transparent',border:'none',color:'#4A4D60',cursor:'pointer',padding:'4px 8px',borderRadius:4,fontSize:13}} onMouseEnter={x=>x.target.style.color='#DC2626'} onMouseLeave={x=>x.target.style.color='#4A4D60'}>✕</button></td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <div className="add-emp-row">
+        <input className="add-inp" placeholder="Last, First" value={newName} onChange={e=>setNewName(e.target.value)} onKeyDown={e=>e.key==='Enter'&&addEmp()} style={{maxWidth:200}}/>
+        <select className="dept-select" value={newDept} onChange={e=>setNewDept(e.target.value)} style={{fontSize:12,padding:'7px 8px'}}>
+          {DEPTS.map(d=><option key={d.id} value={d.id}>{d.label}</option>)}
+        </select>
+        <input className="add-inp" placeholder="Role / Title" value={newRole} onChange={e=>setNewRole(e.target.value)} onKeyDown={e=>e.key==='Enter'&&addEmp()} style={{maxWidth:150}}/>
+        <button className="add-btn" onClick={addEmp}>+ Add</button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Print Schedule ───────────────────────────────────────────────────────────
+function printSchedule(dept, employees, weekLabel) {
+  const deptObj = getDept(dept);
+  const staff = dept === 'all' ? employees : employees.filter(e => e.dept === dept);
+  if (!staff.length) return;
+
+  const cellHtml = ([st, hrs, tm]) => {
+    if (!st || st === '') return '<span style="color:#bbb">—</span>';
+    if (st === 'OFF') return '<span style="color:#bbb">OFF</span>';
+    return `<div style="font-weight:700;font-size:9pt">${st}</div>${tm ? `<div style="font-size:8pt;color:#555">${tm}</div>` : ''}${hrs > 0 ? `<div style="font-size:8pt;color:#777">${hrs}h</div>` : ''}`;
+  };
+
+  const rows = staff.map(e => {
+    const total = e.shifts.reduce((s, [, h]) => s + (h || 0), 0);
+    return `<tr>
+      <td style="font-weight:600;padding:5px 8px;border:1px solid #ddd">${e.name}<div style="font-size:8pt;color:#888">${e.role}</div></td>
+      ${e.shifts.map(sh => `<td style="padding:5px 6px;text-align:center;border:1px solid #ddd;min-width:70px">${cellHtml(sh)}</td>`).join('')}
+      <td style="padding:5px 8px;text-align:center;border:1px solid #ddd;font-weight:800;font-size:11pt;color:${total>=40?'#16a34a':total>=32?'#d97706':'#555'}">${total || '—'}</td>
+    </tr>`;
+  }).join('');
+
+  const deptGroups = dept === 'all'
+    ? DEPTS.map(d => ({ dept: d, emps: staff.filter(e => e.dept === d.id) })).filter(g => g.emps.length)
+    : [{ dept: deptObj, emps: staff }];
+
+  const allRows = deptGroups.map(({ dept: d, emps }) => {
+    const empRows = emps.map(e => {
+      const total = e.shifts.reduce((s, [, h]) => s + (h || 0), 0);
+      return `<tr>
+        <td style="padding:5px 8px;border:1px solid #ddd">${e.name}<div style="font-size:8pt;color:#888">${e.role}</div></td>
+        ${e.shifts.map(sh => `<td style="padding:5px 6px;text-align:center;border:1px solid #ddd;min-width:68px">${cellHtml(sh)}</td>`).join('')}
+        <td style="padding:5px 8px;text-align:center;border:1px solid #ddd;font-weight:800">${total || '—'}</td>
+      </tr>`;
+    }).join('');
+    const sectionHdr = dept === 'all' ? `<tr><td colspan="9" style="background:${d.color}22;color:${d.color};font-weight:800;font-size:9pt;letter-spacing:.06em;text-transform:uppercase;padding:6px 8px;border:1px solid #ddd">${d.label} — ${emps.length} staff</td></tr>` : '';
+    return sectionHdr + empRows;
+  }).join('');
+
+  const totalSchedHrs = staff.reduce((s, e) => s + e.shifts.reduce((ss, [, h]) => ss + (h || 0), 0), 0);
+
+  const html = `<!DOCTYPE html><html><head><meta charset="UTF-8">
+<title>Schedule — ${deptObj.label} — ${weekLabel}</title>
+<style>
+  @page{size:landscape;margin:.6in .5in;}
+  *{box-sizing:border-box;margin:0;padding:0;}
+  body{font-family:'Segoe UI',Arial,sans-serif;font-size:10pt;color:#111;}
+  .no-print{margin-bottom:12px;}
+  @media print{.no-print{display:none;}}
+  .hdr{border-bottom:3px solid ${deptObj.color};padding-bottom:10px;margin-bottom:14px;display:flex;justify-content:space-between;align-items:flex-end;}
+  .hdr-left h1{font-size:15pt;font-weight:800;color:#111;letter-spacing:.02em;}
+  .hdr-left h1 span{color:${deptObj.color};}
+  .hdr-left p{font-size:9pt;color:#666;margin-top:3px;}
+  .hdr-right{text-align:right;font-size:9pt;color:#888;}
+  table{width:100%;border-collapse:collapse;}
+  thead th{background:#f5f5f5;font-weight:700;font-size:9pt;text-align:center;padding:7px 6px;border:1px solid #ddd;letter-spacing:.03em;}
+  thead th:first-child{text-align:left;}
+  .event-row td{font-size:8pt;color:#888;text-align:center;padding:3px 6px;border:1px solid #eee;font-style:italic;background:#fafafa;}
+  .footer{margin-top:12px;padding-top:8px;border-top:1px solid #ddd;font-size:8pt;color:#999;display:flex;justify-content:space-between;}
+</style></head><body>
+<div class="no-print" style="padding:12px 0">
+  <button onclick="window.print()" style="padding:8px 20px;background:${deptObj.color};color:#fff;border:none;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;margin-right:8px">🖨 Print Schedule</button>
+  <button onclick="window.close()" style="padding:8px 16px;background:#eee;border:none;border-radius:6px;font-size:13px;cursor:pointer">Close</button>
+</div>
+<div class="hdr">
+  <div class="hdr-left">
+    <h1>SCHEDULING <span>MATRIX</span>${dept !== 'all' ? ` — ${deptObj.label.toUpperCase()}` : ' — ALL DEPARTMENTS'}</h1>
+    <p>${weekLabel} &nbsp;·&nbsp; ${staff.length} Staff &nbsp;·&nbsp; ${totalSchedHrs} Total Scheduled Hours</p>
+  </div>
+  <div class="hdr-right">Printed ${new Date().toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})}<br/>CONFIDENTIAL</div>
+</div>
+<table>
+  <thead>
+    <tr>
+      <th style="width:170px;text-align:left">EMPLOYEE</th>
+      ${DAYS.map((d,i) => `<th>
+        <div>${d}</div>
+        <div style="font-weight:500;color:#888">${WEEK_DATES[i][0]}</div>
+      </th>`).join('')}
+      <th>HRS</th>
+    </tr>
+    <tr class="event-row">
+      <td></td>
+      ${WEEK_EVENTS.map(ev => `<td>${ev.event}</td>`).join('')}
+      <td></td>
+    </tr>
+  </thead>
+  <tbody>${allRows}</tbody>
+</table>
+<div class="footer">
+  <span>Scheduling Matrix — ${weekLabel}</span>
+  <span>${deptObj.label} Schedule</span>
+</div>
+</body></html>`;
+
+  const win = window.open('', '_blank', 'width=1200,height=800');
+  win.document.write(html);
+  win.document.close();
+}
+
+// ─── Declining Balance View ───────────────────────────────────────────────────
+function DecBalView({ laborData, actuals }) {
+  const { MARCH_DAYS } = window;
+  const [selDept, setSelDept] = useState('kitchen_prem');
+
+  const ld = laborData.find(l => l.dept === selDept) || {};
+  const dept = getDept(selDept);
+  const budget = ld.budget || ld.forecast || 0;
+  const mtdActual = actuals?.[selDept]?.total || 0;
+  const remaining = budget - mtdActual;
+  const pctUsed = budget > 0 ? Math.min(100, (mtdActual / budget) * 100) : 0;
+
+  // Build day rows with running balance
+  const rows = useMemo(() => {
+    const rate = AVG_RATES[selDept] || 30;
+    let runBalance = budget;
+    let cumFcst = 0;
+    return MARCH_DAYS.map((day, i) => {
+      // Forecast: use file data for kp/rc, else 0
+      const dayFcst = selDept === 'kitchen_prem' ? (day.kp?.f || 0)
+                    : selDept === 'rc_kitchen'   ? (day.rc?.f || 0)
+                    : 0;
+      const dayFcstHrs = selDept === 'kitchen_prem' ? (day.kp?.h || 0)
+                       : selDept === 'rc_kitchen'   ? (day.rc?.h || 0)
+                       : 0;
+      // Actual: from import (by day index within our week, 3/23=idx0…3/29=idx6)
+      const weekStart = new Date(2026, 2, 23); // March 23
+      const dayDate = new Date(2026, 2, parseInt(day.date.split('/')[1]));
+      const di = Math.round((dayDate - weekStart) / 86400000);
+      const actD = (di >= 0 && di <= 6) ? actuals?.[selDept]?.[di] : null;
+      const dayAct = actD?.amount || 0;
+      const dayActHrs = actD?.hours || 0;
+
+      if (dayAct > 0) runBalance -= dayAct;
+      cumFcst += dayFcst;
+
+      const isCurrentWeek = di >= 0 && di <= 6;
+      const isPast = (() => { const d=new Date(2026,2,parseInt(day.date.split('/')[1])); return d < new Date(2026,2,23); })();
+      const isFuture = (() => { const d=new Date(2026,2,parseInt(day.date.split('/')[1])); return d > new Date(2026,2,29); })();
+
+      return { ...day, i, dayFcst, dayFcstHrs, dayAct, dayActHrs, runBalance, cumFcst, isCurrentWeek, isPast, isFuture };
+    });
+  }, [selDept, actuals, budget]);
+
+  const totalFcst = rows.reduce((s, r) => s + r.dayFcst, 0);
+
+  return (
+    <div className="db-view">
+      <div className="db-header">
+        <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:12 }}>
+          <div className="db-title">Declining Balance — {window.ACTIVE_MONTH_LABEL||'March 2026'}</div>
+          <select className="db-dept-select" value={selDept} onChange={e => setSelDept(e.target.value)}>
+            {DEPTS.map(d => <option key={d.id} value={d.id}>{d.label}</option>)}
+          </select>
+        </div>
+        <div className="db-summary">
+          {ld.budget > 0 && <div className="db-big">
+            <span className="db-big-label">Monthly Budget</span>
+            <span className="db-big-val" style={{ color:'#4A4D60' }}>{fmt$(ld.budget)}</span>
+          </div>}
+          <div className="db-big">
+            <span className="db-big-label">Monthly Forecast</span>
+            <span className="db-big-val" style={{ color: dept.color }}>{fmt$(ld.forecast)}</span>
+          </div>
+          <div className="db-big">
+            <span className="db-big-label">MTD Actual</span>
+            <span className="db-big-val" style={{ color: mtdActual > 0 ? '#E8EAF0' : '#4A4D60' }}>{mtdActual > 0 ? fmt$(mtdActual) : 'Not imported'}</span>
+          </div>
+          <div className="db-big">
+            <span className="db-big-label">Remaining Balance</span>
+            <span className={`db-big-val ${remaining >= 0 ? 'pos' : 'neg'}`}>{remaining >= 0 ? '+' : ''}{fmt$(Math.abs(remaining))}</span>
+            <div className="db-progress-bar" style={{ marginTop: 8 }}>
+              <div className="db-progress-fill" style={{ width: `${pctUsed}%`, background: pctUsed > 90 ? '#DC2626' : pctUsed > 70 ? '#E8890C' : dept.color }} />
+            </div>
+            <div style={{ fontSize:9, color:'#6B6F85', marginTop:3 }}>{pctUsed.toFixed(1)}% used</div>
+          </div>
+          <div className="db-big" style={{ marginLeft:8 }}>
+            <span className="db-big-label">Total Forecasted</span>
+            <span className="db-big-val" style={{ color:'#8B8FA8', fontSize:16 }}>{fmt$(totalFcst)}</span>
+          </div>
+        </div>
+      </div>
+
+      <div className="db-body">
+        <div style={{ overflowX:'auto' }}>
+          <table className="db-table">
+            <thead>
+              <tr>
+                <th>Date</th><th>Day</th><th>Event</th>
+                <th className="num">Fcst Hrs</th>
+                <th className="num">Forecast $</th>
+                <th className="num">Actual $</th>
+                <th className="num">Variance</th>
+                <th className="num">Running Balance</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => {
+                const varAmt = r.dayAct > 0 ? r.dayAct - r.dayFcst : null;
+                const rowClass = r.isFuture ? 'db-row future' : r.isCurrentWeek ? 'db-row week-row' : r.dayAct > 0 && varAmt <= 0 ? 'db-row has-actual-good' : r.dayAct > 0 ? 'db-row has-actual-bad' : 'db-row';
+                const balColor = r.runBalance < 0 ? '#F87171' : r.runBalance < budget * 0.2 ? '#E8890C' : '#4ADE80';
+                const balPct = budget > 0 ? Math.max(0, Math.min(100, (r.runBalance / budget) * 100)) : 100;
+                return (
+                  <tr key={i} className={rowClass}>
+                    <td className="db-td date" style={r.isCurrentWeek?{color:dept.color}:{}}>{r.date}</td>
+                    <td className="db-td dow">{r.dow}</td>
+                    <td className="db-td event">{r.event || '—'}</td>
+                    <td className="db-td num" style={{color:'#6B6F85'}}>{r.dayFcstHrs > 0 ? r.dayFcstHrs+'h' : '—'}</td>
+                    <td className="db-td num" style={{color:'#8B8FA8'}}>{r.dayFcst > 0 ? fmt$(r.dayFcst) : '—'}</td>
+                    <td className="db-td num" style={{color: r.dayAct > 0 ? '#E8EAF0' : '#3A3D50'}}>{r.dayAct > 0 ? fmt$(r.dayAct) : '—'}</td>
+                    <td className={`db-td num ${varAmt === null ? 'db-var-zero' : varAmt > 0 ? 'db-var-neg' : 'db-var-pos'}`}>
+                      {varAmt !== null ? (varAmt > 0 ? '+' : '') + fmt$(varAmt) : '—'}
+                    </td>
+                    <td className="db-td num balance" style={{color: balColor}}>
+                      {budget > 0 ? fmt$(r.runBalance) : '—'}
+                      {budget > 0 && <span className="db-balance-bar"><span className="db-balance-fill" style={{width:`${balPct}%`,background:balColor,opacity:.7}}/></span>}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Statistics View ──────────────────────────────────────────────────────────
+function StatsView({ employees, canonEmployees, weekShifts, budgetCfg, laborData, actuals }) {
+  const { dates: WEEK_DATES, events: WEEK_EVENTS_CTX } = useWeek();
+  const WEEK_EVENTS = WEEK_EVENTS_CTX;
+  const schedHrsByDept = useMemo(() => {
+    const m = {}; DEPTS.forEach(d => { m[d.id] = 0; });
+    employees.forEach(e => { const h = e.shifts.reduce((s,[,h])=>s+(h||0),0); m[e.dept] = (m[e.dept]||0)+h; });
+    return m;
+  }, [employees]);
+
+  const hrsByDay = useMemo(() => {
+    const arr = Array(7).fill(0);
+    employees.forEach(e => { e.shifts.forEach(([,h],di) => { if(h>0) arr[di]+=h; }); });
+    return arr;
+  }, [employees]);
+
+  const totalHrs = Object.values(schedHrsByDept).reduce((s,h)=>s+h,0);
+  const totalFcst = laborData.reduce((s,l)=>s+l.forecast,0);
+  const totalBudget = laborData.reduce((s,l)=>s+(l.budget||0),0);
+  const totalAct = DEPTS.reduce((s,d)=>s+(actuals?.[d.id]?.total||0),0);
+  const staffScheduled = employees.filter(e=>e.shifts.some(([s])=>s&&s!=='OFF'&&s!=='')).length;
+  const avgHrs = staffScheduled > 0 ? (totalHrs/staffScheduled).toFixed(1) : 0;
+  const maxDayHrs = Math.max(...hrsByDay, 1);
+  const maxDayIdx = hrsByDay.indexOf(Math.max(...hrsByDay));
+
+  // Per dept stats
+  const deptStats = DEPTS.map(d => {
+    const ld = laborData.find(l=>l.dept===d.id)||{};
+    const hrs = schedHrsByDept[d.id]||0;
+    const rate = AVG_RATES[d.id]||30;
+    const wkFcst = hrs*rate;
+    const actAmt = actuals?.[d.id]?.total||0;
+    const actHrs = DEPTS.reduce((s)=>s,0); // placeholder
+    const varAmt = actAmt > 0 ? actAmt - ld.forecast : null;
+    const varPct = ld.forecast > 0 && varAmt !== null ? (varAmt/ld.forecast)*100 : null;
+    const util = ld.budget > 0 ? Math.min(120,((actAmt||ld.forecast)/ld.budget)*100) : null;
+    const staff = employees.filter(e=>e.dept===d.id).length;
+    return { dept:d, ld, hrs, wkFcst, actAmt, varAmt, varPct, util, staff };
+  }).filter(r=>r.staff>0 || r.ld.forecast>0);
+
+  // Event analysis
+  const eventGroups = { 'Dark':[], 'Active Event':[] };
+  WEEK_EVENTS.forEach((ev,i)=>{
+    const key = ev.event === 'Dark' ? 'Dark' : 'Active Event';
+    const hrs = hrsByDay[i]; const fcst = hrs*(totalHrs>0?(totalFcst/totalHrs):30);
+    eventGroups[key].push({day:DAYS[i],hrs,fcst});
+  });
+
+  const insights = [
+    hrsByDay[maxDayIdx]>0 && { icon:'📅', text:<><strong>{DAYS[maxDayIdx]}</strong> is the busiest day — {hrsByDay[maxDayIdx]}h scheduled</> },
+    avgHrs>0 && { icon:'⏱', text:<>Average <strong>{avgHrs} hours</strong> per scheduled employee</> },
+    totalAct>0 && totalAct>totalFcst && { icon:'⚠️', text:<>MTD actuals exceed forecast by <strong style={{color:'#F87171'}}>{fmt$(totalAct-totalFcst)}</strong></> },
+    totalAct>0 && totalAct<=totalFcst && { icon:'✅', text:<>MTD actuals under forecast — <strong style={{color:'#4ADE80'}}>{fmt$(totalFcst-totalAct)}</strong> remaining</> },
+    deptStats.filter(d=>d.util>100).length>0 && { icon:'🔴', text:<>{deptStats.filter(d=>d.util>100).map(d=>d.dept.label).join(', ')} over budget</> },
+    employees.filter(e=>e.shifts.reduce((s,[,h])=>s+(h||0),0)>40).length>0 && { icon:'🕐', text:<><strong>{employees.filter(e=>e.shifts.reduce((s,[,h])=>s+(h||0),0)>40).length} employees</strong> scheduled for overtime (40+ hrs)</> },
+  ].filter(Boolean);
+
+  return (
+    <div className="stats-view">
+      {/* KPI Cards */}
+      <div className="stats-section">
+        <div className="stats-section-title">Key Metrics — Week of Mar 23–29, 2026</div>
+        <div className="kpi-grid">
+          {[
+            { label:'Staff Scheduled', val:staffScheduled, sub:`of ${employees.length} total` },
+            { label:'Total Sched Hours', val:totalHrs+'h', sub:`${avgHrs}h avg/person` },
+            { label:'Monthly Forecast', val:fmt$(totalFcst), sub:'All departments', color:'#E8890C' },
+            totalBudget>0 && { label:'Monthly Budget', val:fmt$(totalBudget), sub:'Authorized spend', color:'#6B6F85' },
+            totalAct>0 && { label:'MTD Actual', val:fmt$(totalAct), sub:`${((totalAct/totalFcst)*100).toFixed(1)}% of forecast`, color: totalAct<=totalFcst?'#4ADE80':'#F87171' },
+            totalAct>0 && { label:'Remaining', val:(totalFcst-totalAct>=0?'+':'')+fmt$(totalFcst-totalAct), sub:'vs forecast', color:totalFcst-totalAct>=0?'#4ADE80':'#F87171' },
+          ].filter(Boolean).map((k,i)=>(
+            <div className="kpi-card" key={i}>
+              <div className="kpi-label">{k.label}</div>
+              <div className="kpi-val" style={{color:k.color||'#E8EAF0'}}>{k.val}</div>
+              <div className="kpi-sub">{k.sub}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* FOH/BOH + Premium/R&C split */}
+      <div className="stats-section">
+        <div className="stats-section-title">Labor Breakdown</div>
+        <div className="stats-two-col">
+          {[
+            {title:'Front of House vs Back of House', pairs:[['Front of House',DEPT_GROUPS.foh,'#06B6D4'],['Back of House',DEPT_GROUPS.boh,'#E8890C']]},
+            {title:'Premium vs R&C',                  pairs:[['Premium',DEPT_GROUPS.premium,'#E8890C'],['R&C',DEPT_GROUPS.rc,'#4ADE80']]},
+          ].map(({title,pairs})=>{
+            const rows = pairs.map(([label,ids,color])=>{
+              const hrs = ids.reduce((s,id)=>s+(schedHrsByDept[id]||0),0);
+              const fcst = ids.reduce((s,id)=>s+(laborData.find(l=>l.dept===id)?.forecast||0),0);
+              const act = ids.reduce((s,id)=>s+(actuals?.[id]?.total||0),0);
+              const staff = ids.reduce((s,id)=>s+employees.filter(e=>e.dept===id).length,0);
+              return {label,ids,color,hrs,fcst,act,staff};
+            });
+            const totHrs = rows.reduce((s,r)=>s+r.hrs,0)||1;
+            const totFcst = rows.reduce((s,r)=>s+r.fcst,0)||1;
+            const totAct = rows.reduce((s,r)=>s+r.act,0);
+            return (
+              <div key={title} className="stats-card">
+                <div className="stats-card-title">{title}</div>
+                {rows.map(r=>(
+                  <div key={r.label} style={{marginBottom:12}}>
+                    <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:5}}>
+                      <span style={{fontSize:12,fontWeight:700,color:r.color}}>{r.label}</span>
+                      <span style={{fontSize:10,color:'#6B6F85'}}>{r.staff} staff · {r.hrs}h</span>
+                    </div>
+                    <div style={{display:'flex',gap:6,marginBottom:3}}>
+                      <span style={{fontSize:9,color:'#4A4D60',width:52,fontWeight:700}}>HOURS</span>
+                      <div style={{flex:1,height:6,background:'#2A2D3A',borderRadius:3,overflow:'hidden'}}>
+                        <div style={{height:'100%',width:`${(r.hrs/totHrs)*100}%`,background:r.color+'aa'}}/></div>
+                      <span style={{fontSize:10,fontWeight:700,minWidth:64,textAlign:'right',color:'#8B8FA8'}}>{((r.hrs/totHrs)*100).toFixed(0)}%</span>
+                    </div>
+                    <div style={{display:'flex',gap:6,marginBottom:3}}>
+                      <span style={{fontSize:9,color:'#4A4D60',width:52,fontWeight:700}}>FORECAST</span>
+                      <div style={{flex:1,height:6,background:'#2A2D3A',borderRadius:3,overflow:'hidden'}}>
+                        <div style={{height:'100%',width:`${(r.fcst/totFcst)*100}%`,background:r.color}}/></div>
+                      <span style={{fontSize:10,fontWeight:700,minWidth:64,textAlign:'right',color:r.color}}>{fmt$(r.fcst)}</span>
+                    </div>
+                    {totAct>0 && <div style={{display:'flex',gap:6}}>
+                      <span style={{fontSize:9,color:'#4A4D60',width:52,fontWeight:700}}>ACTUAL</span>
+                      <div style={{flex:1,height:6,background:'#2A2D3A',borderRadius:3,overflow:'hidden'}}>
+                        <div style={{height:'100%',width:`${totAct>0?(r.act/totAct)*100:0}%`,background:'#E8EAF0'}}/></div>
+                      <span style={{fontSize:10,fontWeight:700,minWidth:64,textAlign:'right',color:'#E8EAF0'}}>{r.act>0?fmt$(r.act):'—'}</span>
+                    </div>}
+                  </div>
+                ))}
+              </div>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Supervisor Labor — daily × dept */}
+      <div className="stats-section">
+        <div className="stats-section-title">Supervisor Labor by Day <span style={{color:'#6B6F85',fontWeight:500,textTransform:'none',letterSpacing:0,marginLeft:6}}>(Manager, Chef, Sous, Lead, Captain, Supervisor, Director)</span></div>
+        <div style={{background:'#1C1E26',border:'1px solid #2A2D3A',borderRadius:10,overflow:'hidden'}}>
+          <table className="perf-table" style={{minWidth:900}}>
+            <thead>
+              <tr>
+                <th>Department</th><th>Supervisors</th>
+                {DAYS.map(d=><th key={d} className="r">{d}</th>)}
+                <th className="r">Wk Hrs</th><th className="r">Wk Cost</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(() => {
+                const isSup = e => /manager|chef|sous|lead|captain|supervisor|director|\bhead\b/i.test(e.role||'');
+                const sups = employees.filter(isSup);
+                const rows = DEPTS.map(d=>{
+                  const deptSups = sups.filter(s=>s.dept===d.id);
+                  if(!deptSups.length) return null;
+                  const perDay = Array(7).fill(0).map((_,i)=>({h:0,c:0}));
+                  deptSups.forEach(s=>{
+                    s.shifts.forEach((sh,i)=>{
+                      const hrs = sh[1]||0;
+                      if(hrs>0){ perDay[i].h += hrs; perDay[i].c += hrs * getEmpRate(s); }
+                    });
+                  });
+                  const wkH = perDay.reduce((s,p)=>s+p.h,0);
+                  const wkC = perDay.reduce((s,p)=>s+p.c,0);
+                  return { d, deptSups, perDay, wkH, wkC };
+                }).filter(Boolean);
+                if(!rows.length) return <tr><td colSpan={11} style={{textAlign:'center',color:'#4A4D60',padding:'20px 0',fontSize:11}}>No supervisor roles detected. Add roles like "Manager", "Chef", "Sous Chef", "Lead", "Captain" in the People tab.</td></tr>;
+                const tot = { perDay:Array(7).fill(0).map(()=>({h:0,c:0})), wkH:0, wkC:0 };
+                rows.forEach(r=>{ r.perDay.forEach((p,i)=>{ tot.perDay[i].h += p.h; tot.perDay[i].c += p.c; }); tot.wkH+=r.wkH; tot.wkC+=r.wkC; });
+                return <>
+                  {rows.map(({d,deptSups,perDay,wkH,wkC})=>(
+                    <tr key={d.id}>
+                      <td><span style={{display:'inline-flex',alignItems:'center',gap:7}}><span style={{width:9,height:9,borderRadius:'50%',background:d.color,display:'inline-block'}}/><span style={{color:d.color,fontWeight:700}}>{d.label}</span></span></td>
+                      <td style={{color:'#8B8FA8',fontSize:11,maxWidth:180,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}} title={deptSups.map(s=>s.name+' ('+s.role+')').join(', ')}>{deptSups.length} — {deptSups.map(s=>s.name.split(',')[0]).join(', ')}</td>
+                      {perDay.map((p,i)=>(
+                        <td key={i} style={{textAlign:'right',padding:'6px 10px'}}>
+                          {p.h>0?<><div style={{fontWeight:700,color:'#E8EAF0',fontSize:11}}>{p.h}h</div><div style={{fontSize:9,color:'#6B6F85'}}>{fmt$(p.c)}</div></>:<span style={{color:'#3A3D50'}}>—</span>}
+                        </td>
+                      ))}
+                      <td style={{textAlign:'right',fontWeight:800,color:d.color}}>{wkH}h</td>
+                      <td style={{textAlign:'right',fontWeight:800,color:d.color}}>{fmt$(wkC)}</td>
+                    </tr>
+                  ))}
+                  <tr className="tot-row" style={{background:'#13151C',borderTop:'2px solid #2A2D3A'}}>
+                    <td style={{fontWeight:800}}>Total</td>
+                    <td style={{color:'#6B6F85',fontSize:11}}>{sups.length} total</td>
+                    {tot.perDay.map((p,i)=>(
+                      <td key={i} style={{textAlign:'right',padding:'6px 10px'}}>
+                        {p.h>0?<><div style={{fontWeight:800,color:'#E8EAF0',fontSize:11}}>{p.h}h</div><div style={{fontSize:9,color:'#8B8FA8'}}>{fmt$(p.c)}</div></>:<span style={{color:'#3A3D50'}}>—</span>}
+                      </td>
+                    ))}
+                    <td style={{textAlign:'right',fontWeight:900,color:'#E8890C'}}>{tot.wkH}h</td>
+                    <td style={{textAlign:'right',fontWeight:900,color:'#E8890C'}}>{fmt$(tot.wkC)}</td>
+                  </tr>
+                </>;
+              })()}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* H&W / Fringe — monthly actual + projected per dept */}
+      <div className="stats-section">
+        <div className="stats-section-title">Health &amp; Welfare / Fringe — Monthly by Department</div>
+        <div className="stats-sub" style={{marginTop:-8,marginBottom:10,color:'#6B6F85',fontSize:11}}>
+          Actual = hours already worked (from One &amp; Done imports when a person-day match exists, else scheduled hours for past days). Projected = scheduled hours for remaining days. Work-dept overrides from the schedule are respected; imported cost-center departments take priority when present.
+        </div>
+        <div style={{background:'#1C1E26',border:'1px solid #2A2D3A',borderRadius:10,overflow:'hidden'}}>
+          <table className="perf-table">
+            <thead>
+              <tr>
+                <th>Department</th>
+                <th className="r">B Plan Hrs</th>
+                <th className="r">V Plan Hrs</th>
+                <th className="r">Total Hrs</th>
+                <th className="r">Actual H&amp;W</th>
+                <th className="r">Projected H&amp;W</th>
+                <th className="r" style={{background:'#E8890C11',color:'#E8890C'}}>Month Total</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(() => {
+                const plans = budgetCfg?.hwPlans || { b:{hw:8.91,edu:0.07,legal:0.11,name:'B Plan'}, v:{hw:3.42,edu:0.07,legal:0.11,name:'V Plan'} };
+                const defaultPlan = budgetCfg?.defaultPlan || 'b';
+                const FALLBACK_PLAN = { hw:0, edu:0, legal:0, name:'—' };
+                const rateOf = plan => { const p = plans[plan] || plans[defaultPlan] || FALLBACK_PLAN; return (p.hw||0)+(p.edu||0)+(p.legal||0); };
+                const today = new Date();
+                const isPast = (monthDay) => { const d = new Date(2026, 2, monthDay); return d <= today; };
+                // Index actual records by monthDay → normalized name
+                const recs = (actuals?._records) || [];
+                const actByDayName = {}; // { monthDay: { normName: {hours, dept} } }
+                const norm = s => (s||'').toLowerCase().replace(/[^a-z]/g,'');
+                recs.forEach(r => {
+                  if (!actByDayName[r.monthDay]) actByDayName[r.monthDay] = {};
+                  const key = norm(r.name);
+                  const existing = actByDayName[r.monthDay][key];
+                  actByDayName[r.monthDay][key] = { hours: (existing?.hours||0)+r.hours, dept: r.dept };
+                });
+
+                const tally = {};
+                DEPTS.forEach(d=>{ tally[d.id] = { bActualHrs:0, vActualHrs:0, bProjHrs:0, vProjHrs:0, actualAmt:0, projAmt:0 }; });
+                (canonEmployees||[]).forEach(emp => {
+                  const plan = emp.plan || defaultPlan;
+                  const rate = rateOf(plan);
+                  const empKey = norm(emp.name);
+                  (window.WEEKS||[]).forEach(wk => {
+                    const wkSh = (weekShifts||{})[wk.id] || {};
+                    const shifts = wkSh[emp.id];
+                    shifts && shifts.forEach((sh, di) => {
+                      const monthDay = wk.dayIdx[di];
+                      if (monthDay == null) return;
+                      const schedHrs = sh[1] || 0;
+                      const workDept = sh[5] || emp.dept;
+                      if (!tally[workDept]) return;
+
+                      // Does an actual record exist for this person + day?
+                      const actRec = actByDayName[monthDay]?.[empKey];
+                      const past = isPast(monthDay);
+
+                      if (actRec && actRec.hours > 0) {
+                        // Use actual hours. Dept comes from the actual record (cost-center mapped) if it resolves.
+                        const actDept = (actRec.dept && tally[actRec.dept]) ? actRec.dept : workDept;
+                        if (plan === 'b') tally[actDept].bActualHrs += actRec.hours;
+                        else if (plan === 'v') tally[actDept].vActualHrs += actRec.hours;
+                        tally[actDept].actualAmt += actRec.hours * rate;
+                      } else if (schedHrs > 0) {
+                        // Fallback: scheduled hrs → actual if past, projected if future
+                        if (past) {
+                          if (plan === 'b') tally[workDept].bActualHrs += schedHrs;
+                          else if (plan === 'v') tally[workDept].vActualHrs += schedHrs;
+                          tally[workDept].actualAmt += schedHrs * rate;
+                        } else {
+                          if (plan === 'b') tally[workDept].bProjHrs += schedHrs;
+                          else if (plan === 'v') tally[workDept].vProjHrs += schedHrs;
+                          tally[workDept].projAmt += schedHrs * rate;
+                        }
+                      }
+                    });
+                  });
+                });
+                const rows = DEPTS.map(d => ({ d, ...tally[d.id] }))
+                  .filter(r => r.bActualHrs + r.vActualHrs + r.bProjHrs + r.vProjHrs > 0);
+                if (!rows.length) return <tr><td colSpan={7} style={{textAlign:'center',color:'#4A4D60',padding:'20px 0',fontSize:11}}>No scheduled hours across March weeks yet.</td></tr>;
+                const tot = rows.reduce((a,r)=>({
+                  bActualHrs:a.bActualHrs+r.bActualHrs, vActualHrs:a.vActualHrs+r.vActualHrs,
+                  bProjHrs:a.bProjHrs+r.bProjHrs, vProjHrs:a.vProjHrs+r.vProjHrs,
+                  actualAmt:a.actualAmt+r.actualAmt, projAmt:a.projAmt+r.projAmt,
+                }),{bActualHrs:0,vActualHrs:0,bProjHrs:0,vProjHrs:0,actualAmt:0,projAmt:0});
+                return <>
+                  {rows.map(({d,bActualHrs,vActualHrs,bProjHrs,vProjHrs,actualAmt,projAmt})=>{
+                    const bH = bActualHrs+bProjHrs; const vH = vActualHrs+vProjHrs; const total = actualAmt+projAmt;
+                    return <tr key={d.id}>
+                      <td><span style={{display:'inline-flex',alignItems:'center',gap:7}}><span style={{width:9,height:9,borderRadius:'50%',background:d.color,display:'inline-block'}}/><span style={{color:d.color,fontWeight:700}}>{d.label}</span></span></td>
+                      <td style={{textAlign:'right',color:bH>0?'#93C5FD':'#3A3D50'}}>{bH>0?bH+'h':'—'}</td>
+                      <td style={{textAlign:'right',color:vH>0?'#FDA4A4':'#3A3D50'}}>{vH>0?vH+'h':'—'}</td>
+                      <td style={{textAlign:'right',fontWeight:700,color:'#E8EAF0'}}>{(bH+vH)+'h'}</td>
+                      <td style={{textAlign:'right',fontWeight:600,color:actualAmt>0?'#E8EAF0':'#4A4D60'}}>{actualAmt>0?fmt$(actualAmt):'—'}</td>
+                      <td style={{textAlign:'right',fontWeight:600,color:projAmt>0?'#8B8FA8':'#4A4D60',fontStyle:projAmt>0?'italic':'normal'}}>{projAmt>0?fmt$(projAmt):'—'}</td>
+                      <td style={{textAlign:'right',fontWeight:800,color:d.color}}>{fmt$(total)}</td>
+                    </tr>;
+                  })}
+                  <tr className="tot-row" style={{background:'#13151C',borderTop:'2px solid #2A2D3A'}}>
+                    <td style={{fontWeight:800}}>Month Total</td>
+                    <td style={{textAlign:'right',fontWeight:800,color:'#93C5FD'}}>{(tot.bActualHrs+tot.bProjHrs)}h</td>
+                    <td style={{textAlign:'right',fontWeight:800,color:'#FDA4A4'}}>{(tot.vActualHrs+tot.vProjHrs)}h</td>
+                    <td style={{textAlign:'right',fontWeight:800,color:'#E8EAF0'}}>{(tot.bActualHrs+tot.vActualHrs+tot.bProjHrs+tot.vProjHrs)}h</td>
+                    <td style={{textAlign:'right',fontWeight:800,color:'#E8EAF0'}}>{fmt$(tot.actualAmt)}</td>
+                    <td style={{textAlign:'right',fontWeight:800,color:'#8B8FA8',fontStyle:'italic'}}>{fmt$(tot.projAmt)}</td>
+                    <td style={{textAlign:'right',fontWeight:900,color:'#E8890C',fontSize:13}}>{fmt$(tot.actualAmt+tot.projAmt)}</td>
+                  </tr>
+                </>;
+              })()}
+            </tbody>
+          </table>
+        </div>
+        <div style={{display:'flex',gap:14,marginTop:8,fontSize:10,color:'#6B6F85'}}>
+          {Object.entries(budgetCfg?.hwPlans || {}).map(([k,p])=>{
+            const r = ((p?.hw||0)+(p?.edu||0)+(p?.legal||0));
+            const col = k==='b'?'#2563EB':k==='v'?'#D97757':'#6B6F85';
+            return <span key={k}><span style={{width:8,height:8,background:col,borderRadius:2,display:'inline-block',marginRight:4,verticalAlign:'middle'}}/>{p?.name||k}: ${r.toFixed(2)}/hr</span>;
+          })}
+          <span style={{color:'#4A4D60'}}>— edit rates on the Budget tab</span>
+        </div>
+      </div>
+
+      {/* Dept performance */}
+      <div className="stats-section">
+        <div className="stats-section-title">Department Performance</div>
+        <div style={{background:'#1C1E26',border:'1px solid #2A2D3A',borderRadius:10,overflow:'hidden'}}>
+          <table className="perf-table">
+            <thead>
+              <tr>
+                <th>Department</th><th>Staff</th><th className="r">Sched Hrs</th>
+                <th className="r">Wk Forecast</th><th className="r">Mth Forecast</th>
+                <th className="r">MTD Actual</th><th className="r">Variance</th>
+                <th style={{width:120}}>Budget Utilization</th>
+              </tr>
+            </thead>
+            <tbody>
+              {deptStats.map(({dept:d,ld,hrs,wkFcst,actAmt,varAmt,varPct,util,staff})=>(
+                <tr key={d.id}>
+                  <td><span style={{display:'inline-flex',alignItems:'center',gap:7}}><span style={{width:9,height:9,borderRadius:'50%',background:d.color,display:'inline-block'}}/><span style={{color:d.color,fontWeight:700}}>{d.label}</span></span></td>
+                  <td style={{color:'#6B6F85'}}>{staff}</td>
+                  <td style={{textAlign:'right',fontWeight:600}}>{hrs>0?hrs+'h':'—'}</td>
+                  <td style={{textAlign:'right',color:'#8B8FA8'}}>{wkFcst>0?fmt$(wkFcst):'—'}</td>
+                  <td style={{textAlign:'right',color:d.color,fontWeight:700}}>{fmt$(ld.forecast)}</td>
+                  <td style={{textAlign:'right',fontWeight:700,color:actAmt>0?'#E8EAF0':'#4A4D60'}}>{actAmt>0?fmt$(actAmt):'—'}</td>
+                  <td style={{textAlign:'right'}} className={varAmt===null?'':varAmt>0?'neg':'pos'}>{varAmt!==null?(varAmt>0?'+':'')+fmt$(varAmt):'—'}</td>
+                  <td>
+                    {util!==null?<>
+                      <div style={{display:'flex',justifyContent:'space-between',marginBottom:3}}>
+                        <span style={{fontSize:9,color:'#6B6F85'}}>{util.toFixed(0)}%</span>
+                        {util>100&&<span className="kpi-badge badge-red">Over</span>}
+                        {util>80&&util<=100&&<span className="kpi-badge badge-amber">On Track</span>}
+                        {util<=80&&<span className="kpi-badge badge-green">Under</span>}
+                      </div>
+                      <div className="util-bar"><div className="util-fill" style={{width:`${Math.min(100,util)}%`,background:util>100?'#DC2626':util>80?'#E8890C':d.color}}/></div>
+                    </>:<span style={{fontSize:10,color:'#4A4D60'}}>No budget set</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Day dist + Insights */}
+      <div className="stats-two-col">
+        <div className="stats-section">
+          <div className="stats-section-title">Scheduled Hours by Day</div>
+          <div className="stats-card" style={{display:'flex',flexDirection:'column',gap:8}}>
+            {DAYS.map((d,i)=>(
+              <div key={d} className="day-dist">
+                <span className="day-dist-label">{d}</span>
+                <div className="day-dist-track">
+                  <div className="day-dist-fill" style={{width:`${(hrsByDay[i]/maxDayHrs)*100}%`,background:i===maxDayIdx?'#E8890C':'#2563EB88'}}>
+                    {hrsByDay[i]>0&&`${hrsByDay[i]}h`}
+                  </div>
+                </div>
+                <span className="day-dist-val">{hrsByDay[i]>0?fmt$(hrsByDay[i]*(totalHrs>0?totalFcst/totalHrs:30)):'—'}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="stats-section">
+          <div className="stats-section-title">Insights &amp; Flags</div>
+          <div className="stats-card">
+            {insights.length>0 ? insights.map((ins,i)=>(
+              <div key={i} className="insight-row">
+                <span className="insight-icon">{ins.icon}</span>
+                <span className="insight-text">{ins.text}</span>
+              </div>
+            )):<div style={{color:'#4A4D60',fontSize:12,padding:'8px 0'}}>Import One &amp; Done data for deeper insights.</div>}
+            {totalAct===0&&<div className="insight-row"><span className="insight-icon">💡</span><span className="insight-text">Go to <strong>Import</strong> tab to load actual labor data from One &amp; Done report.</span></div>}
+          </div>
+
+          <div className="stats-section-title" style={{marginTop:16}}>Event Type Analysis</div>
+          <div className="stats-card">
+            {Object.entries(eventGroups).map(([type,days])=>{
+              const totHrs=days.reduce((s,d)=>s+d.hrs,0);
+              const totFcst=days.reduce((s,d)=>s+d.fcst,0);
+              return (
+                <div key={type} className="insight-row">
+                  <span className="insight-icon">{type==='Dark'?'🌑':'🎪'}</span>
+                  <span className="insight-text">
+                    <strong>{type}</strong> ({days.length} days) — {totHrs}h / {fmt$(totFcst)}<br/>
+                    <span style={{fontSize:10,color:'#6B6F85'}}>Days: {days.map(d=>d.day).join(', ')}</span>
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Budget View ──────────────────────────────────────────────────────────────
+function BudgetView({ config, sales, events, onConfigChange, onSalesChange, onEventsChange }) {
+  const { MARCH_DAYS, DEFAULT_BUDGET_CONFIG } = window;
+  // Guard against partial config from stale localStorage
+  const safeCfg = {
+    officeFlat: config?.officeFlat ?? DEFAULT_BUDGET_CONFIG.officeFlat,
+    pcts: { ...DEFAULT_BUDGET_CONFIG.pcts, ...(config?.pcts || {}) },
+    hwPlans: {
+      ...DEFAULT_BUDGET_CONFIG.hwPlans,
+      ...(config?.hwPlans || {}),
+    },
+    defaultPlan: config?.defaultPlan || DEFAULT_BUDGET_CONFIG.defaultPlan,
+  };
+  config = safeCfg;
+  const daysInMonth = MARCH_DAYS.length;
+
+  // Pool totals by area
+  const salesByArea = useMemo(()=>{
+    const prem = {food:0,nabev:0,alcohol:0,total:0};
+    const rc = {food:0,nabev:0,alcohol:0,total:0};
+    MARCH_DAYS.forEach((d,i)=>{
+      const s = sales[i] || {};
+      ['prem_food','prem_nabev','prem_alcohol','rc_food','rc_nabev','rc_alcohol'].forEach(k=>{
+        const v = parseFloat(s[k])||0;
+        if(k.startsWith('prem_')) { prem[k.replace('prem_','')] += v; prem.total += v; }
+        else { rc[k.replace('rc_','')] += v; rc.total += v; }
+      });
+    });
+    return { prem, rc, grand: prem.total + rc.total };
+  },[sales]);
+
+  // Labor $ per dept = pct × total area sales + (office flat for admin)
+  const deptBudgets = useMemo(()=>{
+    const out = {};
+    DEPTS.forEach(d=>{
+      const cfg = config.pcts[d.id] || { pct:0, area:'premium' };
+      const pool = cfg.area === 'rc' ? salesByArea.rc.total : salesByArea.prem.total;
+      const fromPct = pool * (cfg.pct/100);
+      const fromFlat = d.id === 'admin' ? (config.officeFlat||0) : 0;
+      out[d.id] = { fromPct, fromFlat, total: fromPct + fromFlat, pool, pct:cfg.pct, area:cfg.area };
+    });
+    return out;
+  },[config,salesByArea]);
+
+  const totalBudget = Object.values(deptBudgets).reduce((s,b)=>s+b.total,0);
+  const totalPctPrem = DEPTS.filter(d=>config.pcts[d.id]?.area==='premium').reduce((s,d)=>s+(config.pcts[d.id]?.pct||0),0);
+  const totalPctRc = DEPTS.filter(d=>config.pcts[d.id]?.area==='rc').reduce((s,d)=>s+(config.pcts[d.id]?.pct||0),0);
+
+  // Daily budget: distribute each dept's budget based on that day's sales share of the area
+  const dailyBudgets = useMemo(()=>{
+    return MARCH_DAYS.map((d,i)=>{
+      const s = sales[i] || {};
+      const daySalesPrem = ['prem_food','prem_nabev','prem_alcohol'].reduce((a,k)=>a+(parseFloat(s[k])||0),0);
+      const daySalesRc = ['rc_food','rc_nabev','rc_alcohol'].reduce((a,k)=>a+(parseFloat(s[k])||0),0);
+      let dayBudget = 0; const byDept = {};
+      DEPTS.forEach(dept=>{
+        const cfg = config.pcts[dept.id] || { pct:0, area:'premium' };
+        const pool = cfg.area === 'rc' ? salesByArea.rc.total : salesByArea.prem.total;
+        const daySales = cfg.area === 'rc' ? daySalesRc : daySalesPrem;
+        const share = pool > 0 ? daySales/pool : 0;
+        const fromPct = share * (cfg.pct/100) * pool;
+        const flatDay = dept.id==='admin' ? (config.officeFlat||0)/daysInMonth : 0;
+        byDept[dept.id] = fromPct + flatDay;
+        dayBudget += byDept[dept.id];
+      });
+      return { date:d.date, dow:d.dow, event:d.event, daySalesPrem, daySalesRc, total:daySalesPrem+daySalesRc, budget:dayBudget, byDept };
+    });
+  },[sales,config,salesByArea,daysInMonth]);
+
+  const updateSale = (di, key, val)=>{ onSalesChange({ ...sales, [di]: { ...(sales[di]||{}), [key]: val } }); };
+  const updatePct = (deptId, pct)=>{ onConfigChange({ ...config, pcts:{ ...config.pcts, [deptId]:{ ...(config.pcts[deptId]||{}), pct:parseFloat(pct)||0 } } }); };
+  const updateArea = (deptId, area)=>{ onConfigChange({ ...config, pcts:{ ...config.pcts, [deptId]:{ ...(config.pcts[deptId]||{}), area } } }); };
+  const updateFlat = (v)=>{ onConfigChange({ ...config, officeFlat:parseFloat(v)||0 }); };
+  const resetDefaults = ()=>{ if(confirm('Reset % allocation to defaults?')) onConfigChange(JSON.parse(JSON.stringify(DEFAULT_BUDGET_CONFIG))); };
+
+  const fillFromForecast = ()=>{
+    if(!confirm('Fill sales from the default March forecast (sample distribution)? Current values will be overwritten.')) return;
+    // Estimate sales from the file's daily forecast: if kp/rc f is the labor $, back out sales via % (prem 10%, rc 23%)
+    const newSales = {};
+    MARCH_DAYS.forEach((d,i)=>{
+      const kpSales = (d.kp?.f||0) / 0.10;  // premium culinary labor 10% of sales
+      const rcSales = (d.rc?.f||0) / 0.23;  // R&C labor ~23% of sales
+      newSales[i] = {
+        prem_food: Math.round(kpSales*0.70),
+        prem_nabev: Math.round(kpSales*0.10),
+        prem_alcohol: Math.round(kpSales*0.20),
+        rc_food: Math.round(rcSales*0.65),
+        rc_nabev: Math.round(rcSales*0.15),
+        rc_alcohol: Math.round(rcSales*0.20),
+      };
+    });
+    onSalesChange(newSales);
+  };
+
+  return (
+    <div className="bg-view">
+      {/* Summary */}
+      <div className="bg-section">
+        <div className="bg-title">Budget Summary — {window.ACTIVE_MONTH_LABEL||'March 2026'}</div>
+        <div className="bg-sub">Labor budget is calculated as: <strong style={{color:'#E8890C'}}>(% of sales × total area sales) + office flat</strong>. Edit sales and percentages below; totals recompute live.</div>
+        <div className="bg-summary-grid">
+          <div className="bg-summary-card"><div className="bg-sc-label">Total Projected Sales</div><div className="bg-sc-val" style={{color:'#E8EAF0'}}>{fmt$(salesByArea.grand)}</div><div className="bg-sc-sub">{daysInMonth} days</div></div>
+          <div className="bg-summary-card"><div className="bg-sc-label">Premium Sales</div><div className="bg-sc-val" style={{color:'#E8890C'}}>{fmt$(salesByArea.prem.total)}</div><div className="bg-sc-sub">F: {fmt$(salesByArea.prem.food)} · NA: {fmt$(salesByArea.prem.nabev)} · A: {fmt$(salesByArea.prem.alcohol)}</div></div>
+          <div className="bg-summary-card"><div className="bg-sc-label">R&C Sales</div><div className="bg-sc-val" style={{color:'#4ADE80'}}>{fmt$(salesByArea.rc.total)}</div><div className="bg-sc-sub">F: {fmt$(salesByArea.rc.food)} · NA: {fmt$(salesByArea.rc.nabev)} · A: {fmt$(salesByArea.rc.alcohol)}</div></div>
+          <div className="bg-summary-card" style={{background:'#E8890C12',borderColor:'#E8890C44'}}><div className="bg-sc-label">Total Labor Budget</div><div className="bg-sc-val" style={{color:'#fff'}}>{fmt$(totalBudget)}</div><div className="bg-sc-sub">{salesByArea.grand>0?((totalBudget/salesByArea.grand)*100).toFixed(1)+'% of sales':'—'}</div></div>
+          <div className="bg-summary-card"><div className="bg-sc-label">Premium Labor %</div><div className="bg-sc-val" style={{color:'#E8890C',fontSize:14}}>{totalPctPrem.toFixed(1)}%</div><div className="bg-sc-sub">on Premium sales</div></div>
+          <div className="bg-summary-card"><div className="bg-sc-label">R&C Labor %</div><div className="bg-sc-val" style={{color:'#4ADE80',fontSize:14}}>{totalPctRc.toFixed(1)}%</div><div className="bg-sc-sub">on R&C sales</div></div>
+        </div>
+      </div>
+
+      <div className="bg-grid-2">
+        {/* % Allocation */}
+        <div className="bg-section">
+          <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:6}}>
+            <div><div className="bg-title">Labor % Allocation</div><div className="bg-sub" style={{marginBottom:0}}>% of area sales assigned to each department</div></div>
+            <button onClick={resetDefaults} className="import-btn-sec" style={{padding:'4px 10px',fontSize:10}}>Reset Defaults</button>
+          </div>
+          <table className="pct-table">
+            <thead><tr><th>Department</th><th>Area</th><th className="r" style={{textAlign:'right'}}>% of Sales</th><th className="r" style={{textAlign:'right'}}>Budget</th></tr></thead>
+            <tbody>
+              <tr className="pct-group-row"><td colSpan={4}>Front of House</td></tr>
+              {DEPTS.filter(d=>DEPT_GROUPS.foh.includes(d.id)).map(d=>{
+                const cfg = config.pcts[d.id]||{pct:0,area:'premium'}; const b = deptBudgets[d.id]||{};
+                return <tr key={d.id}>
+                  <td><span style={{display:'inline-flex',alignItems:'center',gap:7}}><span style={{width:9,height:9,borderRadius:'50%',background:d.color}}/><span style={{color:d.color,fontWeight:700}}>{d.label}</span></span></td>
+                  <td><select className="area-select" value={cfg.area} onChange={e=>updateArea(d.id,e.target.value)}><option value="premium">Premium</option><option value="rc">R&C</option></select></td>
+                  <td style={{textAlign:'right'}}><input className="pct-input" type="number" step="0.1" min="0" value={cfg.pct} onChange={e=>updatePct(d.id,e.target.value)}/>%</td>
+                  <td style={{textAlign:'right',fontWeight:700,color:d.color}}>{fmt$(b.total)}</td>
+                </tr>;
+              })}
+              <tr className="pct-group-row"><td colSpan={4}>Back of House</td></tr>
+              {DEPTS.filter(d=>DEPT_GROUPS.boh.includes(d.id)).map(d=>{
+                const cfg = config.pcts[d.id]||{pct:0,area:'premium'}; const b = deptBudgets[d.id]||{};
+                return <tr key={d.id}>
+                  <td><span style={{display:'inline-flex',alignItems:'center',gap:7}}><span style={{width:9,height:9,borderRadius:'50%',background:d.color}}/><span style={{color:d.color,fontWeight:700}}>{d.label}</span></span></td>
+                  <td><select className="area-select" value={cfg.area} onChange={e=>updateArea(d.id,e.target.value)}><option value="premium">Premium</option><option value="rc">R&C</option></select></td>
+                  <td style={{textAlign:'right'}}><input className="pct-input" type="number" step="0.1" min="0" value={cfg.pct} onChange={e=>updatePct(d.id,e.target.value)}/>%</td>
+                  <td style={{textAlign:'right',fontWeight:700,color:d.color}}>{fmt$(b.total)}</td>
+                </tr>;
+              })}
+              <tr style={{background:'#13151C'}}>
+                <td colSpan={2} style={{fontWeight:700,color:'#C8CAD6'}}>Office (flat monthly)</td>
+                <td style={{textAlign:'right'}}><input className="sales-input" style={{width:90,color:'#0D9488',fontWeight:700}} type="number" value={config.officeFlat} onChange={e=>updateFlat(e.target.value)}/></td>
+                <td style={{textAlign:'right',fontWeight:700,color:'#0D9488'}}>{fmt$(config.officeFlat)}</td>
+              </tr>
+              <tr className="tot-row"><td colSpan={3} style={{fontWeight:800}}>Total Labor Budget</td><td style={{textAlign:'right',fontSize:14,color:'#E8890C'}}>{fmt$(totalBudget)}</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        {/* Daily rollup */}
+        <div className="bg-section">
+          <div className="bg-title">Daily Budget Rollup</div>
+          <div className="bg-sub">Each day's budget scales with that day's share of monthly sales.</div>
+          <div style={{maxHeight:540,overflowY:'auto'}}>
+            <table className="bg-day-table">
+              <thead><tr><th>Date</th><th>Event</th><th className="num">Prem Sales</th><th className="num">R&C Sales</th><th className="num">Total</th><th className="num">Labor $</th><th className="num">%</th></tr></thead>
+              <tbody>
+                {dailyBudgets.map((d,i)=>{
+                  const tot=d.daySalesPrem+d.daySalesRc; const pct=tot>0?(d.budget/tot)*100:0;
+                  return <tr key={i}>
+                    <td style={{fontWeight:700,color:'#C8CAD6',whiteSpace:'nowrap'}}>{d.date} <span style={{fontSize:9,color:'#6B6F85',fontWeight:500}}>{d.dow}</span></td>
+                    <td style={{color:'#8B8FA8',maxWidth:140,whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>{d.event||'—'}</td>
+                    <td className="num" style={{color:'#E8890C'}}>{d.daySalesPrem>0?fmt$(d.daySalesPrem):'—'}</td>
+                    <td className="num" style={{color:'#4ADE80'}}>{d.daySalesRc>0?fmt$(d.daySalesRc):'—'}</td>
+                    <td className="num" style={{fontWeight:700}}>{tot>0?fmt$(tot):'—'}</td>
+                    <td className="num" style={{fontWeight:800,color:'#E8EAF0'}}>{fmt$(d.budget)}</td>
+                    <td className="num" style={{fontSize:10,color:'#6B6F85'}}>{pct>0?pct.toFixed(1)+'%':''}</td>
+                  </tr>;
+                })}
+                <tr className="tot-row"><td colSpan={2}>Month Total</td>
+                  <td className="num" style={{color:'#E8890C'}}>{fmt$(salesByArea.prem.total)}</td>
+                  <td className="num" style={{color:'#4ADE80'}}>{fmt$(salesByArea.rc.total)}</td>
+                  <td className="num">{fmt$(salesByArea.grand)}</td>
+                  <td className="num" style={{color:'#E8890C',fontSize:14}}>{fmt$(totalBudget)}</td>
+                  <td className="num" style={{fontSize:10}}>{salesByArea.grand>0?((totalBudget/salesByArea.grand)*100).toFixed(1)+'%':''}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      {/* H&W / Fringe plans editor */}
+      <div className="bg-section">
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:6}}>
+          <div>
+            <div className="bg-title">Health &amp; Welfare / Fringe Rates</div>
+            <div className="bg-sub" style={{marginBottom:0}}>Per-hour $ rates applied to each employee's hours worked. Assign plans per person on the People tab.</div>
+          </div>
+          <button onClick={()=>{ if(confirm('Reset H&W rates to defaults?')) onConfigChange({ ...config, hwPlans:JSON.parse(JSON.stringify(DEFAULT_BUDGET_CONFIG.hwPlans)), defaultPlan:'b' }); }} className="import-btn-sec" style={{padding:'4px 10px',fontSize:10}}>Reset to defaults</button>
+        </div>
+        <div style={{overflowX:'auto'}}>
+          <table className="sales-table" style={{maxWidth:760}}>
+            <thead><tr><th style={{width:150}}>Plan Name</th><th className="num">H&amp;W $/hr</th><th className="num">Education $/hr</th><th className="num">Legal $/hr</th><th className="num" style={{background:'#E8890C11',color:'#E8890C'}}>Combined $/hr</th><th style={{width:110,textAlign:'center'}}>Default</th></tr></thead>
+            <tbody>
+              {Object.entries(config.hwPlans).map(([k,p])=>{
+                const combined = (p.hw||0)+(p.edu||0)+(p.legal||0);
+                const updatePlan = (field,v)=>{
+                  const nextVal = field==='name' ? v : (parseFloat(v)||0);
+                  onConfigChange({ ...config, hwPlans:{ ...config.hwPlans, [k]:{ ...p, [field]:nextVal } } });
+                };
+                return <tr key={k}>
+                  <td><input className="sales-input" type="text" value={p.name} onChange={e=>updatePlan('name',e.target.value)} style={{width:130,fontWeight:700,color:k==='b'?'#93C5FD':'#FDA4A4'}}/></td>
+                  <td className="num"><input className="sales-input" type="number" step=".01" min="0" value={p.hw} onChange={e=>updatePlan('hw',e.target.value)} style={{width:80,fontWeight:700,color:'#E8EAF0'}}/></td>
+                  <td className="num"><input className="sales-input" type="number" step=".01" min="0" value={p.edu} onChange={e=>updatePlan('edu',e.target.value)} style={{width:80,fontWeight:700,color:'#E8EAF0'}}/></td>
+                  <td className="num"><input className="sales-input" type="number" step=".01" min="0" value={p.legal} onChange={e=>updatePlan('legal',e.target.value)} style={{width:80,fontWeight:700,color:'#E8EAF0'}}/></td>
+                  <td className="num" style={{fontWeight:800,color:'#E8890C'}}>${combined.toFixed(2)}</td>
+                  <td style={{textAlign:'center'}}>
+                    <label style={{display:'inline-flex',alignItems:'center',gap:4,cursor:'pointer',fontSize:11,color:config.defaultPlan===k?'#4ADE80':'#6B6F85'}}>
+                      <input type="radio" name="defaultPlan" checked={config.defaultPlan===k} onChange={()=>onConfigChange({ ...config, defaultPlan:k })} style={{margin:0}}/>
+                      {config.defaultPlan===k?'✓ Default':'Set default'}
+                    </label>
+                  </td>
+                </tr>;
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Sales input table */}
+      <div className="bg-section">
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:6}}>
+          <div><div className="bg-title">Projected Daily Sales</div><div className="bg-sub" style={{marginBottom:0}}>Enter projected sales per day for each revenue category. Tab between cells.</div></div>
+          <button onClick={fillFromForecast} className="import-btn-sec" style={{padding:'4px 10px',fontSize:10}}>Fill from Forecast</button>
+        </div>
+        <div style={{overflowX:'auto'}}>
+          <table className="sales-table">
+            <thead>
+              <tr>
+                <th style={{width:70}}>Date</th>
+                <th>Event</th>
+                <th className="num" colSpan={3} style={{textAlign:'center',background:'#E8890C11',color:'#E8890C'}}>PREMIUM</th>
+                <th className="num" colSpan={3} style={{textAlign:'center',background:'#16A34A11',color:'#4ADE80'}}>R&amp;C</th>
+                <th className="num">Day Total</th>
+              </tr>
+              <tr>
+                <th></th><th></th>
+                <th className="num">Food</th><th className="num">NA Bev</th><th className="num">Alcohol</th>
+                <th className="num">Food</th><th className="num">NA Bev</th><th className="num">Alcohol</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {MARCH_DAYS.map((d,i)=>{
+                const s = sales[i] || {};
+                const row = ['prem_food','prem_nabev','prem_alcohol','rc_food','rc_nabev','rc_alcohol'];
+                const tot = row.reduce((a,k)=>a+(parseFloat(s[k])||0),0);
+                return <tr key={i}>
+                  <td style={{fontWeight:700,color:'#C8CAD6',whiteSpace:'nowrap'}}>{d.date} <span style={{fontSize:9,color:'#6B6F85',fontWeight:500}}>{d.dow}</span></td>
+                  <td style={{color:'#8B8FA8',maxWidth:220,padding:'3px 6px'}}>
+                    <input className="sales-input" type="text" value={events[i]!==undefined?events[i]:(d.event||'')} placeholder="Event name" onChange={e=>onEventsChange({...events,[i]:e.target.value})} style={{width:'100%',textAlign:'left'}}/>
+                  </td>
+                  {row.map(k=><td key={k} className="num" style={{padding:'3px 6px'}}><input className="sales-input" type="number" min="0" step="100" value={s[k]||''} placeholder="0" onChange={e=>updateSale(i,k,e.target.value)}/></td>)}
+                  <td className="num" style={{fontWeight:800,color:tot>0?'#E8EAF0':'#4A4D60'}}>{tot>0?fmt$(tot):'—'}</td>
+                </tr>;
+              })}
+              <tr className="tot-row">
+                <td colSpan={2}>Month Total</td>
+                <td className="num" style={{color:'#E8890C'}}>{fmt$(salesByArea.prem.food)}</td>
+                <td className="num" style={{color:'#E8890C'}}>{fmt$(salesByArea.prem.nabev)}</td>
+                <td className="num" style={{color:'#E8890C'}}>{fmt$(salesByArea.prem.alcohol)}</td>
+                <td className="num" style={{color:'#4ADE80'}}>{fmt$(salesByArea.rc.food)}</td>
+                <td className="num" style={{color:'#4ADE80'}}>{fmt$(salesByArea.rc.nabev)}</td>
+                <td className="num" style={{color:'#4ADE80'}}>{fmt$(salesByArea.rc.alcohol)}</td>
+                <td className="num" style={{fontSize:14}}>{fmt$(salesByArea.grand)}</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── App ──────────────────────────────────────────────────────────────────────
+const TWEAK_DEFAULTS = /*EDITMODE-BEGIN*/{"accentColor":"#E8890C","weekLabel":"Week of Mar 23–29, 2026"}/*EDITMODE-END*/;
+
+function App() {
+  const saved = JSON.parse(localStorage.getItem('km_v2')||'null');
+  const safeBudgetCfg = (() => {
+    const b = saved?.budgetCfg;
+    const DEF = window.DEFAULT_BUDGET_CONFIG;
+    if (!b || !b.pcts) return DEF;
+    return {
+      officeFlat: b.officeFlat ?? DEF.officeFlat,
+      pcts: { ...DEF.pcts, ...b.pcts },
+      hwPlans: { ...DEF.hwPlans, ...(b.hwPlans || {}) },
+      defaultPlan: b.defaultPlan || DEF.defaultPlan,
+    };
+  })();
+
+  // Migrate old single-week schema → multi-week. Seeds legacy shifts into wk4 (the original week).
+  const initialEmployees = saved?.employees || INIT_EMPLOYEES;
+  const initialWeekShifts = (() => {
+    if (saved?.weekShifts) return saved.weekShifts;
+    const seed = { wk1:{}, wk2:{}, wk3:{}, wk4:{}, wk5:{} };
+    (saved?.employees || INIT_EMPLOYEES).forEach(e => {
+      if (e.shifts && e.shifts.some(s=>s[0]||s[1]||s[2])) {
+        seed.wk4[e.id] = JSON.parse(JSON.stringify(e.shifts));
+      }
+    });
+    return seed;
+  })();
+  // Strip .shifts from canonical employees (now lives in weekShifts)
+  const cleanEmployees = initialEmployees.map(({shifts, ...rest}) => rest);
+  const [employees, setEmployees] = useState(cleanEmployees);
+  // Month key helper
+  const monthKey = (am) => `${am.year}-${String(am.month).padStart(2,'0')}`;
+  // Migrate legacy top-level weekShifts/actuals/sales/events into per-month buckets
+  const savedMonth = saved?.activeMonth || {year:2026, month:3};
+  const initialMonthBuckets = (() => {
+    if (saved?.monthBuckets) return saved.monthBuckets;
+    const k = monthKey(savedMonth);
+    return {
+      [k]: {
+        weekShifts: initialWeekShifts,
+        actuals: saved?.actuals || {},
+        sales:   saved?.sales || {},
+        events:  saved?.events || {},
+      },
+    };
+  })();
+  const [monthBuckets, setMonthBuckets] = useState(initialMonthBuckets);
+  const [activeMonth, setActiveMonth] = useState(savedMonth);
+  const [viewingArchive, setViewingArchive] = useState(null);
+  const [activeWeek, setActiveWeek] = useState(saved?.activeWeek || 'wk4');
+  const [activeTab,  setActiveTab]  = useState('schedule');
+  const [activeDept, setActiveDept] = useState('all');
+  const [showLabor,  setShowLabor]  = useState(true);
+  const [budgetCfg,  setBudgetCfg]  = useState(safeBudgetCfg);
+  const [archives,   setArchives]   = useState(saved?.archives || []);
+  const [showArchMenu,setShowArchMenu]=useState(false);
+  const [tweaks, setTweaks]         = useState(TWEAK_DEFAULTS);
+  const [showTweaks, setShowTweaks] = useState(false);
+  const [syncStatus, setSyncStatus] = useState('connecting');
+  const [syncPaused, setSyncPaused] = useState(false);
+  const applyingRemoteRef = useRef(false);
+
+  // ─── Active-month data derivation ──────────────────────────────────────────
+  // When viewingArchive is set, show that archived month read-only. Otherwise use activeMonth bucket.
+  const archiveEntry = viewingArchive ? archives.find(a=>a.id===viewingArchive) : null;
+  const readonly = !!archiveEntry;
+  const activeMonthKey = monthKey(activeMonth);
+  const currentBucket = archiveEntry ? {
+    weekShifts: archiveEntry.weekShifts || {},
+    actuals:    archiveEntry.actuals || {},
+    sales:      archiveEntry.sales || {},
+    events:     archiveEntry.events || {},
+  } : (monthBuckets[activeMonthKey] || { weekShifts:{wk1:{},wk2:{},wk3:{},wk4:{},wk5:{}}, actuals:{}, sales:{}, events:{} });
+
+  const weekShifts = currentBucket.weekShifts;
+  const actuals    = currentBucket.actuals;
+  const sales      = currentBucket.sales;
+  const events     = currentBucket.events;
+
+  // Ensure current month has a bucket
+  useEffect(()=>{
+    if (readonly) return;
+    if (!monthBuckets[activeMonthKey]) {
+      setMonthBuckets(b => ({ ...b, [activeMonthKey]: { weekShifts:{wk1:{},wk2:{},wk3:{},wk4:{},wk5:{}}, actuals:{}, sales:{}, events:{} }}));
+    }
+  },[activeMonthKey]);
+
+  // Setters: write to active bucket (block writes while viewing an archive)
+  const mutateBucket = (patch) => {
+    if (readonly) { alert('Viewing an archived month. Exit archive to edit.'); return; }
+    setMonthBuckets(prev => {
+      const cur = prev[activeMonthKey] || { weekShifts:{wk1:{},wk2:{},wk3:{},wk4:{},wk5:{}}, actuals:{}, sales:{}, events:{} };
+      const nextBucket = typeof patch === 'function' ? patch(cur) : { ...cur, ...patch };
+      return { ...prev, [activeMonthKey]: nextBucket };
+    });
+  };
+  const setWeekShifts = (next) => mutateBucket(cur => ({ ...cur, weekShifts: typeof next==='function' ? next(cur.weekShifts) : next }));
+  const setActuals    = (next) => mutateBucket(cur => ({ ...cur, actuals:    typeof next==='function' ? next(cur.actuals)    : next }));
+  const setSales      = (next) => mutateBucket(cur => ({ ...cur, sales:      typeof next==='function' ? next(cur.sales)      : next }));
+  const setEvents     = (next) => mutateBucket(cur => ({ ...cur, events:     typeof next==='function' ? next(cur.events)     : next }));
+
+  useEffect(()=>{ localStorage.setItem('km_v2',JSON.stringify({employees,activeMonth,monthBuckets,activeWeek,budgetCfg,archives})); },[employees,activeMonth,monthBuckets,activeWeek,budgetCfg,archives]);
+
+  // ─── Firebase live sync ────────────────────────────────────────────────────
+  // Subscribe: listen for remote changes and merge in
+  useEffect(()=>{
+    if (!window.KMSync) return;
+    const unsub = window.KMSync.subscribe(({ status, remoteSnapshot, applyingRemote }) => {
+      setSyncStatus(status);
+      if (applyingRemote && remoteSnapshot && !syncPaused) {
+        applyingRemoteRef.current = true;
+        if (remoteSnapshot.employees)    setEmployees(remoteSnapshot.employees);
+        if (remoteSnapshot.activeMonth)  setActiveMonth(remoteSnapshot.activeMonth);
+        if (remoteSnapshot.monthBuckets) setMonthBuckets(remoteSnapshot.monthBuckets);
+        if (remoteSnapshot.budgetCfg)    setBudgetCfg(remoteSnapshot.budgetCfg);
+        if (remoteSnapshot.archives)     setArchives(remoteSnapshot.archives);
+        setTimeout(()=>{ applyingRemoteRef.current = false; }, 50);
+      }
+    });
+    return unsub;
+  }, [syncPaused]);
+
+  // Push: when local state changes (and not from remote apply), push to Firebase
+  useEffect(()=>{
+    if (!window.KMSync) return;
+    if (applyingRemoteRef.current) return;
+    if (syncPaused) return;
+    if (readonly) return;
+    window.KMSync.push({ employees, activeMonth, monthBuckets, budgetCfg, archives });
+  }, [employees, activeMonth, monthBuckets, budgetCfg, archives, syncPaused, readonly]);
+
+  // Apply user event overrides into live monthDays so Declining Balance/Stats pick them up
+  useEffect(()=>{
+    window.MARCH_DAYS.forEach((d,i)=>{ if(events[i]!==undefined) d.event = events[i]; });
+  },[events, activeMonth]);
+  useEffect(()=>{
+    window.addEventListener('message',e=>{
+      if(e.data?.type==='__activate_edit_mode') setShowTweaks(true);
+      if(e.data?.type==='__deactivate_edit_mode') setShowTweaks(false);
+    });
+    window.parent.postMessage({type:'__edit_mode_available'},'*');
+  },[]);
+
+  // Build merged employees-with-shifts for the active week; consumer components read this
+  const activeEmployees = useMemo(() => {
+    const w = weekShifts[activeWeek] || {};
+    return employees.map(e => ({ ...e, shifts: w[e.id] || Array(7).fill(['',0,'']) }));
+  }, [employees, weekShifts, activeWeek]);
+
+  const handleCellEdit = useCallback((empId,dayIdx,shift)=>{
+    setWeekShifts(prev => {
+      const wk = prev[activeWeek] || {};
+      const existing = wk[empId] || Array(7).fill(['',0,'']);
+      const updated = existing.map((s,i)=>i===dayIdx?shift:s);
+      return { ...prev, [activeWeek]: { ...wk, [empId]: updated } };
+    });
+  },[activeWeek]);
+
+  // Rebuild month calendar whenever activeMonth (or archive being viewed) changes
+  const effectiveMonth = archiveEntry ? { year: archiveEntry.year || activeMonth.year, month: archiveEntry.monthNum || activeMonth.month } : activeMonth;
+  const monthData = useMemo(()=>{
+    const md = window.buildMonth(effectiveMonth.year, effectiveMonth.month);
+    window.WEEKS = md.weeks;
+    window.MARCH_DAYS = md.monthDays;
+    window.WEEK_START_SERIAL = md.weekStartSerial;
+    window.ACTIVE_MONTH_LABEL = md.label;
+    window.ACTIVE_MONTH = { year: md.year, month: md.month };
+    return md;
+  },[effectiveMonth.year, effectiveMonth.month]);
+  // Clamp activeWeek if month changed and the old week id no longer exists
+  useEffect(()=>{
+    if (!monthData.weeks.find(w=>w.id===activeWeek)) setActiveWeek(monthData.weeks[0]?.id || 'wk1');
+  },[monthData]);
+    // Active week initial guard: wk4 only exists if the old March data. Use wk4 if available else wk1 via effect below.
+    // Week selection validity is enforced by an effect watching monthData.
+
+  // Week object currently viewed
+  const curWeek = useMemo(()=>monthData.weeks.find(w=>w.id===activeWeek)||monthData.weeks[0],[monthData,activeWeek]);
+  const weekCtx = useMemo(()=>{
+    if (!curWeek) return { dates:[], events:[] };
+    const dates = curWeek.dates;
+    const wevents = curWeek.dayIdx.map((monthDay,i)=>{
+      const midx = monthDay!=null ? (monthData.monthDays.findIndex(d=>d.date.endsWith('/'+monthDay))) : -1;
+      const dayObj = midx>=0 ? monthData.monthDays[midx] : null;
+      const override = midx>=0 ? events[midx] : undefined;
+      return { day:i, event: override!==undefined ? override : (dayObj?.event||'') };
+    });
+    window.WEEK_DATES = dates; window.WEEK_EVENTS = wevents;
+    return { dates, events: wevents };
+  },[curWeek,events,monthData]);
+
+  const totalHrs = activeEmployees.reduce((s,e)=>s+e.shifts.reduce((ss,[,h])=>ss+(h||0),0),0);
+  const totalFcst = LABOR_DATA.reduce((s,d)=>s+d.forecast,0);
+  const totalAct = Object.values(actuals).reduce((s,d)=>s+(d.total||0),0);
+
+  return (
+    <WeekContext.Provider value={weekCtx}>
+    <>
+    <div style={{display:'flex',flexDirection:'column',height:'100vh'}}>
+      <div className="app-header">
+        <div className="app-logo">SCHEDULING <span>MATRIX</span></div>
+        <div className="main-tabs">
+          {[['schedule','Schedule'],['budget','Budget'],['declining','Declining Balance'],['stats','Statistics'],['import','Import'],['people','People']].map(([id,lbl])=>(
+            <button key={id} className={`main-tab${activeTab===id?' active':''}`} onClick={()=>setActiveTab(id)}>{lbl}
+              {id==='import'&&totalAct>0&&<span style={{marginLeft:5,background:'#16A34A44',color:'#4ADE80',borderRadius:10,padding:'1px 5px',fontSize:9,fontWeight:800}}>✓</span>}
+            </button>
+          ))}
+        </div>
+        {activeTab==='schedule'&&<>
+          <div className="week-nav">
+            {(() => {
+              const wks = monthData.weeks;
+              const idx = wks.findIndex(w=>w.id===activeWeek);
+              const atStart = idx<=0, atEnd = idx>=wks.length-1;
+              return <>
+                <button className="nav-btn" onClick={()=>{if(!atStart)setActiveWeek(wks[idx-1].id);}} disabled={atStart} style={{opacity:atStart?.35:1,cursor:atStart?'not-allowed':'pointer'}} title="Previous week">‹</button>
+                <select value={activeWeek} onChange={e=>setActiveWeek(e.target.value)} style={{background:'#1C1E26',border:'1px solid #3A3D50',borderRadius:6,color:'#E8EAF0',fontSize:12,fontWeight:600,padding:'6px 10px',outline:'none',cursor:'pointer'}}>
+                  {wks.map(w=><option key={w.id} value={w.id}>{w.label}</option>)}
+                </select>
+                <button className="nav-btn" onClick={()=>{if(!atEnd)setActiveWeek(wks[idx+1].id);}} disabled={atEnd} style={{opacity:atEnd?.35:1,cursor:atEnd?'not-allowed':'pointer'}} title="Next week">›</button>
+              </>;
+            })()}
+          </div>
+          <button className="print-btn" onClick={()=>printSchedule(activeDept,activeEmployees,curWeek.label)} title={activeDept==='all'?'Print all departments':'Print '+getDept(activeDept).label+' schedule'}>🖨 Print{activeDept!=='all'?' '+getDept(activeDept).label:''}</button>
+          <button className={`labor-toggle${showLabor?' active':''}`} onClick={()=>setShowLabor(v=>!v)}>$ Labor</button>
+        </>}
+        <div style={{marginLeft:activeTab==='schedule'?0:'auto',position:'relative',display:'flex',alignItems:'center',gap:8}}>
+          <div title={syncPaused?'Sync paused — working offline':
+            syncStatus==='online'?'Live sync connected. Edits save automatically across all users.':
+            syncStatus==='connecting'?'Connecting to sync…':
+            syncStatus==='offline'?'Offline — changes will sync when connection returns':
+            'Sync error — changes saved locally only'}
+            style={{display:'inline-flex',alignItems:'center',gap:6,padding:'5px 10px',background:'#1C1E26',border:'1px solid '+(syncPaused?'#6B6F85':syncStatus==='online'?'#16A34A66':syncStatus==='offline'?'#EAB30866':syncStatus==='error'?'#DC262666':'#3A3D50'),borderRadius:6,fontSize:10,fontWeight:700,letterSpacing:'.05em',color:syncPaused?'#8B8FA8':syncStatus==='online'?'#4ADE80':syncStatus==='offline'?'#FACC15':syncStatus==='error'?'#F87171':'#C8CAD6',cursor:'pointer'}}
+            onClick={()=>setSyncPaused(p=>!p)}>
+            <span style={{width:7,height:7,borderRadius:'50%',background:syncPaused?'#6B6F85':syncStatus==='online'?'#4ADE80':syncStatus==='offline'?'#FACC15':syncStatus==='error'?'#F87171':'#8B8FA8',animation:syncStatus==='online'&&!syncPaused?'pulse 2s infinite':'none'}}/>
+            {syncPaused?'PAUSED':syncStatus==='online'?'LIVE':syncStatus==='connecting'?'…':syncStatus.toUpperCase()}
+          </div>
+          <button className="print-btn" onClick={()=>setShowArchMenu(v=>!v)} title="Archive / Month actions" style={{background:readonly?'#EAB30833':undefined,borderColor:readonly?'#EAB308':undefined}}>
+            📁 {readonly ? `Viewing: ${archiveEntry.month} (read-only)` : monthData.label} ▾
+          </button>
+          {showArchMenu && <>
+            <div style={{position:'fixed',inset:0,zIndex:400}} onClick={()=>setShowArchMenu(false)}/>
+            <div className="archive-menu">
+              {readonly ? <>
+                <div className="archive-hdr" style={{color:'#EAB308'}}>Read-only Archive</div>
+                <div style={{fontSize:10,color:'#8B8FA8',padding:'6px 10px',lineHeight:1.5}}>You're viewing <b style={{color:'#E8EAF0'}}>{archiveEntry.month}</b>. Exit to return to the current month and resume editing.</div>
+                <div className="archive-item" onClick={()=>{setViewingArchive(null);setShowArchMenu(false);}}>← Exit Archive View</div>
+                <div className="archive-divider"/>
+                <div className="archive-item" onClick={()=>{
+                  const blob={...archiveEntry};
+                  const d=document.createElement('a');d.href='data:application/json;charset=utf-8,'+encodeURIComponent(JSON.stringify(blob,null,2));
+                  d.download=`scheduling-matrix-${archiveEntry.month.toLowerCase().replace(/ /g,'-')}.json`;d.click();setShowArchMenu(false);
+                }}>📥 Export this archive (JSON)</div>
+              </> : <>
+                <div className="archive-hdr">Current Month — {monthData.label}</div>
+                <div className="archive-item" onClick={()=>{
+                  const blob={version:2,employees,activeMonth,monthBuckets,budgetCfg,archives,exported:new Date().toISOString()};
+                  const a=document.createElement('a');a.href='data:application/json;charset=utf-8,'+encodeURIComponent(JSON.stringify(blob,null,2));
+                  a.download=`scheduling-matrix-backup-${new Date().toISOString().slice(0,10)}.json`;a.click();setShowArchMenu(false);
+                }}>📥 Backup / Export All Data (JSON)</div>
+                <div className="archive-item" onClick={()=>{
+                  const inp=document.createElement('input');inp.type='file';inp.accept='.json';
+                  inp.onchange=async e=>{
+                    const f=e.target.files?.[0];if(!f)return;
+                    const txt=await f.text();let data;try{data=JSON.parse(txt);}catch{alert('Invalid JSON file.');return;}
+                    if(!confirm('Restore from this backup? Current data across ALL users will be replaced. This cannot be undone.')) return;
+                    if(data.employees)    setEmployees(data.employees.map(({shifts,...rest})=>rest));
+                    if(data.activeMonth)  setActiveMonth(data.activeMonth);
+                    if(data.monthBuckets) setMonthBuckets(data.monthBuckets);
+                    else if(data.weekShifts){ // v1 backup compatibility
+                      const k=monthKey(data.activeMonth||activeMonth);
+                      setMonthBuckets({[k]:{weekShifts:data.weekShifts,actuals:data.actuals||{},sales:data.sales||{},events:data.events||{}}});
+                    }
+                    if(data.budgetCfg)    setBudgetCfg(data.budgetCfg);
+                    if(data.archives)     setArchives(data.archives);
+                    alert('✓ Backup restored. Live-syncing to all users.');
+                    setShowArchMenu(false);
+                  };
+                  inp.click();
+                }}>📤 Restore from Backup (JSON)</div>
+                <div className="archive-divider"/>
+                <div className="archive-item" onClick={()=>{
+                  // Roll forward to next month
+                  const nextAM = activeMonth.month===12 ? {year:activeMonth.year+1, month:1} : {year:activeMonth.year, month:activeMonth.month+1};
+                  const nextMD = window.buildMonth(nextAM.year, nextAM.month);
+                  if(!confirm(`Roll over to ${nextMD.label}?\n\n• Current month (${monthData.label}) will be archived and viewable read-only\n• Employees carry forward\n• Schedule starts blank (no shifts)\n• Events reset to "Dark"\n• Sales zero out; % allocation & H&W rates carry forward\n• Imported actuals archive with ${monthData.label}`)) return;
+                  // Archive current
+                  const curBucket = monthBuckets[activeMonthKey];
+                  const snapshot = { id:Date.now(), month:monthData.label, monthKey:activeMonthKey, year:activeMonth.year, monthNum:activeMonth.month, archived:new Date().toISOString(),
+                    weekShifts:JSON.parse(JSON.stringify(curBucket?.weekShifts||{})),
+                    actuals:JSON.parse(JSON.stringify(curBucket?.actuals||{})),
+                    sales:JSON.parse(JSON.stringify(curBucket?.sales||{})),
+                    events:JSON.parse(JSON.stringify(curBucket?.events||{})),
+                    employees:JSON.parse(JSON.stringify(employees)),
+                    budgetCfg:JSON.parse(JSON.stringify(budgetCfg)),
+                  };
+                  setArchives([snapshot, ...archives].slice(0,24));
+                  // New month: blank bucket
+                  const newKey = `${nextAM.year}-${String(nextAM.month).padStart(2,'0')}`;
+                  const newWeekShifts = {};
+                  nextMD.weeks.forEach(w=>{ newWeekShifts[w.id] = {}; });
+                  setMonthBuckets(b => ({ ...b, [newKey]: { weekShifts:newWeekShifts, actuals:{}, sales:{}, events:{} }}));
+                  setActiveMonth(nextAM);
+                  setActiveWeek(nextMD.weeks[0].id);
+                  // Zero projected sales — already blank in new bucket. Carry % allocation & H&W (budgetCfg unchanged).
+                  alert(`✓ Rolled to ${nextMD.label}.\n\n${monthData.label} archived. You can view it from the Archived section below.`);
+                  setShowArchMenu(false);
+                }}>✨ Roll to next month →</div>
+                {archives.length>0 && <>
+                  <div className="archive-divider"/>
+                  <div className="archive-hdr">Archived ({archives.length})</div>
+                  {archives.map(a=>(
+                    <div key={a.id} className="archive-item" style={{display:'flex',alignItems:'center',gap:6}}>
+                      <span style={{flex:1,cursor:'pointer'}} onClick={()=>{setViewingArchive(a.id);setShowArchMenu(false);}} title="View read-only">👁 {a.month}</span>
+                      <span style={{fontSize:9,color:'#6B6F85'}}>{new Date(a.archived).toLocaleDateString()}</span>
+                      <span style={{cursor:'pointer',opacity:.6,padding:'0 4px'}} title="Download JSON" onClick={e=>{e.stopPropagation();
+                        const blob={...a};
+                        const d=document.createElement('a');d.href='data:application/json;charset=utf-8,'+encodeURIComponent(JSON.stringify(blob,null,2));
+                        d.download=`scheduling-matrix-${a.month.toLowerCase().replace(/ /g,'-')}.json`;d.click();setShowArchMenu(false);
+                      }}>⬇</span>
+                    </div>
+                  ))}
+                  <div className="archive-divider"/>
+                  <div className="archive-item danger" onClick={()=>{if(confirm('Clear all archives? This cannot be undone.')){setArchives([]);setShowArchMenu(false);}}}>🗑 Clear Archives</div>
+                </>}
+              </>}
+            </div>
+          </>}
+        </div>
+      </div>
+
+      {/* Summary bar */}
+      {activeTab==='schedule'&&(
+        <div className="week-summary">
+          <div className="ws-item"><span className="ws-label">Staff</span><span className="ws-val">{activeEmployees.filter(e=>e.shifts.some(([s])=>s&&s!=='OFF')).length}</span></div>
+          <div className="ws-divider"/>
+          <div className="ws-item"><span className="ws-label">Total Hrs</span><span className="ws-val">{totalHrs}h</span></div>
+          <div className="ws-divider"/>
+          <div className="ws-item"><span className="ws-label">MTD Forecast</span><span className="ws-val" style={{color:'#E8890C'}}>{fmt$(totalFcst)}</span></div>
+          {totalAct>0&&<><div className="ws-divider"/>
+          <div className="ws-item"><span className="ws-label">MTD Actual</span><span className="ws-val" style={{color:'#4ADE80'}}>{fmt$(totalAct)}</span></div></>}
+          <div className="ws-divider"/>
+          {WEEK_EVENTS.map((ev,i)=>(
+            <div key={i} className="ws-item">
+              <span className="ws-label">{DAYS[i]}</span>
+              <span className="ws-val" style={{fontSize:10,color:'#6B6F85'}}>{ev.event}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div className="app-body">
+        {activeTab==='schedule'&&<>
+          <div className="dept-sidebar">
+            <div className="dept-section-label">Departments</div>
+            <button className={`dept-all-btn${activeDept==='all'?' active':''}`} onClick={()=>setActiveDept('all')}>All Departments</button>
+            {DEPTS.map(d=>(
+              <button key={d.id} className={`dept-btn${activeDept===d.id?' active':''}`} onClick={()=>setActiveDept(d.id)}>
+                <span className="dot" style={{background:d.color}}/>
+                <span className="dept-name" style={{color:activeDept===d.id?d.color:'#8B8FA8'}}>{d.label}</span>
+              </button>
+            ))}
+          </div>
+          <div className="schedule-area">
+            <ScheduleGrid employees={activeEmployees} activeDept={activeDept} onCellEdit={handleCellEdit}/>
+          </div>
+          {showLabor&&<LaborPanel employees={activeEmployees} laborData={LABOR_DATA} actuals={actuals}/>}
+        </>}
+        {activeTab==='declining'&&<DecBalView laborData={LABOR_DATA} actuals={actuals}/>}
+        {activeTab==='budget'&&<BudgetView config={budgetCfg} sales={sales} events={events} onConfigChange={setBudgetCfg} onSalesChange={setSales} onEventsChange={setEvents}/>}
+        {activeTab==='stats'&&<StatsView employees={activeEmployees} canonEmployees={employees} weekShifts={weekShifts} budgetCfg={budgetCfg} laborData={LABOR_DATA} actuals={actuals}/>}
+        {activeTab==='import'&&<ImportView onApply={(grouped, records)=>{
+          // Records already have monthDay from parser. Replace actuals for every day covered by this import.
+          const recs = (records||[]).filter(r=>r.monthDay!=null);
+          setActuals(prev => {
+            const next = { ...prev, ...grouped };
+            const touchedDays = new Set(recs.map(r=>r.monthDay));
+            const existing = (prev._records||[]).filter(r => !touchedDays.has(r.monthDay));
+            next._records = [...existing, ...recs];
+            return next;
+          });
+        }} actuals={actuals} activeWeek={activeWeek}/>}
+        {activeTab==='people'&&<PeopleView employees={activeEmployees} canonEmployees={employees} onUpdate={(next)=>{
+          // next contains .shifts from activeEmployees merge — strip before saving to canonical
+          setEmployees(next.map(({shifts, ...rest}) => rest));
+        }} budgetCfg={budgetCfg}/>}
+      </div>
+    </div>
+
+    {showTweaks&&(
+      <div style={{position:'fixed',bottom:20,right:20,background:'#252838',border:'1px solid #3A3D50',borderRadius:12,padding:20,width:260,zIndex:9999,boxShadow:'0 8px 32px #00000070'}}>
+        <div style={{fontWeight:800,fontSize:13,color:'#fff',marginBottom:14}}>Tweaks</div>
+        <div style={{marginBottom:12}}>
+          <div style={{fontSize:10,fontWeight:700,color:'#6B6F85',marginBottom:6}}>ACCENT COLOR</div>
+          <input type="color" value={tweaks.accentColor} style={{width:'100%',height:32,borderRadius:6,border:'none',cursor:'pointer'}}
+            onChange={e=>{const v=e.target.value;setTweaks(t=>({...t,accentColor:v}));window.parent.postMessage({type:'__edit_mode_set_keys',edits:{accentColor:v}},'*');}}/>
+        </div>
+        <div>
+          <div style={{fontSize:10,fontWeight:700,color:'#6B6F85',marginBottom:6}}>WEEK LABEL</div>
+          <input type="text" value={tweaks.weekLabel} style={{background:'#1C1E26',border:'1px solid #3A3D50',borderRadius:6,color:'#E8EAF0',fontSize:12,padding:'6px 10px',width:'100%',outline:'none'}}
+            onChange={e=>{const v=e.target.value;setTweaks(t=>({...t,weekLabel:v}));window.parent.postMessage({type:'__edit_mode_set_keys',edits:{weekLabel:v}},'*');}}/>
+        </div>
+      </div>
+    )}
+    </>
+    </WeekContext.Provider>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>
